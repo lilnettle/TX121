@@ -1,4 +1,305 @@
 import socket
+import threading
+import time
+import json
+from datetime import datetime
+import gi
+
+gi.require_version('Gst', '1.0')
+gi.require_version('GstVideo', '1.0')
+from gi.repository import Gst, GObject, GLib
+
+# Ініціалізація GStreamer
+Gst.init(None)
+
+class CRSFTelemetryReceiver:
+    def __init__(self):
+        self.telemetry_data = {
+            'gps': {'lat': 0, 'lon': 0, 'speed': 0, 'altitude': 0, 'sats': 0, 'fix': 0},
+            'battery': {'voltage': 0, 'current': 0, 'remaining': 0, 'capacity': 0},
+            'link': {'uplink_rssi': -100, 'uplink_lq': 0, 'downlink_rssi': -100, 'downlink_lq': 0},
+            'attitude': {'roll': 0, 'pitch': 0, 'yaw': 0},
+            'flight_mode': 'UNKNOWN',
+            'armed': False,
+            'last_update': time.time()
+        }
+        self.lock = threading.Lock()
+        
+    def parse_crsf_packet(self, data):
+        if len(data) < 4:
+            return None
+        
+        # Перевіряємо CRSF sync byte
+        if data[0] != 0xC8:
+            return None
+            
+        length = data[1] 
+        packet_type = data[2]
+        payload = data[3:3+length-2]  # мінус тип і CRC
+        
+        # Верифікуємо CRC
+        expected_crc = data[3+length-2]
+        calculated_crc = self.crsf_crc8(data[2:3+length-2])
+        if expected_crc != calculated_crc:
+            print(f"⚠️ CRC mismatch: expected {expected_crc:02X}, got {calculated_crc:02X}")
+            return None
+        
+        with self.lock:
+            self.telemetry_data['last_update'] = time.time()
+            
+            if packet_type == 0x02:  # GPS
+                if len(payload) >= 15:
+                    self.telemetry_data['gps'] = {
+                        'lat': int.from_bytes(payload[0:4], 'big', signed=True) / 1e7,
+                        'lon': int.from_bytes(payload[4:8], 'big', signed=True) / 1e7,
+                        'speed': int.from_bytes(payload[8:10], 'big') / 100,  # m/s
+                        'altitude': int.from_bytes(payload[12:14], 'big') + 1000,  # m
+                        'sats': payload[14],
+                        'fix': 1 if payload[14] >= 4 else 0
+                    }
+                    
+            elif packet_type == 0x08:  # Battery/Voltage  
+                if len(payload) >= 8:
+                    voltage = int.from_bytes(payload[0:2], 'big') / 100
+                    current = int.from_bytes(payload[2:4], 'big') / 100
+                    capacity = int.from_bytes(payload[4:7], 'big') if len(payload) >= 7 else 0
+                    remaining = payload[7] if len(payload) >= 8 else 0
+                    
+                    self.telemetry_data['battery'] = {
+                        'voltage': voltage,
+                        'current': current,
+                        'capacity': capacity,
+                        'remaining': remaining
+                    }
+                    
+            elif packet_type == 0x14:  # Link Statistics (ELRS/CRSF)
+                if len(payload) >= 10:
+                    uplink_rssi = payload[0] - 256 if payload[0] > 127 else payload[0]
+                    uplink_lq = payload[1]
+                    uplink_snr = payload[2] - 256 if payload[2] > 127 else payload[2] 
+                    downlink_rssi = payload[3] - 256 if payload[3] > 127 else payload[3]
+                    downlink_lq = payload[4]
+                    downlink_snr = payload[5] - 256 if payload[5] > 127 else payload[5]
+                    
+                    self.telemetry_data['link'] = {
+                        'uplink_rssi': uplink_rssi,
+                        'uplink_lq': uplink_lq,
+                        'uplink_snr': uplink_snr,
+                        'downlink_rssi': downlink_rssi, 
+                        'downlink_lq': downlink_lq,
+                        'downlink_snr': downlink_snr
+                    }
+                    
+            elif packet_type == 0x1E:  # Attitude (Roll/Pitch/Yaw)
+                if len(payload) >= 6:
+                    roll = int.from_bytes(payload[0:2], 'big', signed=True) / 10000
+                    pitch = int.from_bytes(payload[2:4], 'big', signed=True) / 10000  
+                    yaw = int.from_bytes(payload[4:6], 'big', signed=True) / 10000
+                    
+                    self.telemetry_data['attitude'] = {
+                        'roll': roll,
+                        'pitch': pitch, 
+                        'yaw': yaw
+                    }
+                    
+            elif packet_type == 0x21:  # Flight Mode
+                if len(payload) >= 1:
+                    mode_byte = payload[0]
+                    armed = bool(mode_byte & 0x01)
+                    
+                    # Speedybee/Betaflight mode mapping
+                    mode_map = {
+                        0: 'DISARMED', 1: 'MANUAL', 2: 'ACRO', 3: 'ANGLE',
+                        4: 'HORIZON', 5: 'BARO', 6: 'MAG', 7: 'HEADFREE',
+                        8: 'HEADADJ', 9: 'CAMSTAB', 10: 'PASSTHRU', 11: 'RANGEFINDER',
+                        12: 'FAILSAFE', 13: 'GPS_RESCUE', 14: 'ANTI_GRAVITY'
+                    }
+                    
+                    mode_id = (mode_byte >> 1) & 0x0F
+                    flight_mode = mode_map.get(mode_id, f'MODE_{mode_id}')
+                    
+                    self.telemetry_data['flight_mode'] = flight_mode
+                    self.telemetry_data['armed'] = armed
+                    
+        return True
+    
+    def crsf_crc8(self, data):
+        """CRSF CRC8 розрахунок"""
+        crc = 0
+        for b in data:
+            crc ^= b
+            for _ in range(8):
+                if crc & 0x80:
+                    crc = ((crc << 1) ^ 0xD5) & 0xFF
+                else:
+                    crc = (crc << 1) & 0xFF
+        return crc
+
+    def udp_listener(self):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.bind(("0.0.0.0", 6970))  # Приймаємо телеметрію з камери
+        print("🟢 Listening for CRSF telemetry from camera on port 6970...")
+        
+        while True:
+            try:
+                data, addr = sock.recvfrom(64)
+                # Перевіряємо що це від камери
+                if self.parse_crsf_packet(data):
+                    print(f"📡 Telemetry from camera [{addr[0]}:{addr[1]}]: {len(data)} bytes")
+            except Exception as e:
+                print(f"❌ UDP error: {e}")
+    
+    def get_telemetry_text(self):
+        with self.lock:
+            gps = self.telemetry_data['gps']
+            bat = self.telemetry_data['battery'] 
+            link = self.telemetry_data['link']
+            att = self.telemetry_data['attitude']
+            
+            # Статус підключення
+            time_since_update = time.time() - self.telemetry_data['last_update']
+            status = "🟢 ONLINE" if time_since_update < 2.0 else "🔴 OFFLINE"
+            
+            # Статус GPS
+            gps_status = "🛰️ GPS FIX" if gps['fix'] else "❌ NO FIX"
+            
+            # Статус Armed/Disarmed  
+            arm_status = "🔴 ARMED" if self.telemetry_data['armed'] else "🟢 DISARMED"
+            
+            return (
+                f"=== SPEEDYBEE FC TELEMETRY === {status}\n"
+                f"Mode: {self.telemetry_data['flight_mode']} | {arm_status}\n"
+                f"GPS: {gps['lat']:.6f}, {gps['lon']:.6f} | {gps_status}\n"
+                f"Alt: {gps['altitude']}m | Speed: {gps['speed']:.1f}m/s | Sats: {gps['sats']}\n"
+                f"Attitude: R:{att['roll']:.1f}° P:{att['pitch']:.1f}° Y:{att['yaw']:.1f}°\n"
+                f"Battery: {bat['voltage']:.1f}V | {bat['current']:.1f}A | {bat['remaining']}%\n"
+                f"Link: UL {link['uplink_rssi']}dBm LQ{link['uplink_lq']}% | DL {link['downlink_rssi']}dBm LQ{link['downlink_lq']}%\n"
+                f"Time: {datetime.now().strftime('%H:%M:%S')}"
+            )
+
+class VideoStreamer:
+    def __init__(self, telemetry_receiver):
+        self.telemetry = telemetry_receiver
+        self.pipeline = None
+        self.textoverlay = None
+        
+    def create_pipeline(self):
+        # Pipeline для прийому відео з UDP та накладання телеметрії
+        pipeline_str = """
+        udpsrc port=5600 caps="application/x-rtp,encoding-name=H264" !
+        rtph264depay !
+        h264parse !
+        avdec_h264 !
+        videoconvert !
+        textoverlay name=telemetry_overlay
+            text="Waiting for telemetry..." 
+            valignment=top 
+            halignment=left
+            font-desc="Monospace Bold 14"
+            color=0xFFFFFFFF
+            outline-color=0x000000FF
+            line-alignment=left !
+        videoconvert !
+        autovideosink
+        """
+        
+        # Для Radxa Zero 3w з HDMI можна використати:
+        # autovideosink замінити на kmssink connector-id=32 plane-id=31
+        
+        self.pipeline = Gst.parse_launch(pipeline_str)
+        self.textoverlay = self.pipeline.get_by_name("telemetry_overlay")
+        
+        # Встановлюємо bus для обробки повідомлень
+        bus = self.pipeline.get_bus()
+        bus.add_signal_watch()
+        bus.connect("message", self.on_message)
+        
+        return True
+    
+    def on_message(self, bus, message):
+        t = message.type
+        if t == Gst.MessageType.EOS:
+            print("📺 End-of-stream")
+            self.stop()
+        elif t == Gst.MessageType.ERROR:
+            err, debug = message.parse_error()
+            print(f"❌ Video error: {err}: {debug}")
+            self.stop()
+    
+    def update_overlay(self):
+        """Оновлює текст телеметрії на відео"""
+        if self.textoverlay:
+            telemetry_text = self.telemetry.get_telemetry_text()
+            self.textoverlay.set_property("text", telemetry_text)
+        return True  # Повертає True для продовження виклику
+    
+    def start(self):
+        if not self.create_pipeline():
+            return False
+            
+        # Запускаємо pipeline
+        ret = self.pipeline.set_state(Gst.State.PLAYING)
+        if ret == Gst.StateChangeReturn.FAILURE:
+            print("❌ Failed to start video pipeline")
+            return False
+            
+        print("📺 Video pipeline started")
+        
+        # Встановлюємо таймер для оновлення телеметрії кожні 100мс
+        GLib.timeout_add(100, self.update_overlay)
+        
+        return True
+    
+    def stop(self):
+        if self.pipeline:
+            self.pipeline.set_state(Gst.State.NULL)
+
+class GroundStation:
+    def __init__(self):
+        self.telemetry_receiver = CRSFTelemetryReceiver()
+        self.video_streamer = VideoStreamer(self.telemetry_receiver)
+        self.running = False
+        
+    def start(self):
+        print("🚁 CRSF Ground Station starting...")
+        print("=" * 50)
+        
+        # Запускаємо приймач телеметрії в окремому потоці
+        telemetry_thread = threading.Thread(
+            target=self.telemetry_receiver.udp_listener, 
+            daemon=True
+        )
+        telemetry_thread.start()
+        
+        # Запускаємо відео стрім
+        if not self.video_streamer.start():
+            print("❌ Failed to start video")
+            return
+            
+        print("📺 Video stream active")
+        print("📡 Telemetry receiver active") 
+        print("🛑 Press Ctrl+C to stop")
+        
+        # Основний цикл GLib для GStreamer
+        try:
+            loop = GLib.MainLoop()
+            loop.run()
+        except KeyboardInterrupt:
+            print("\n🛑 Shutting down...")
+        finally:
+            self.video_streamer.stop()
+            print("👋 Ground Station stopped")
+
+if __name__ == "__main__":
+    # Для налагодження GStreamer (опціонально)
+    # import os
+    # os.environ['GST_DEBUG'] = '3'
+    
+    ground_station = GroundStation()
+    ground_station.start()
+
+
+import socket
 import time
 import threading
 from evdev import InputDevice, categorize, ecodes, list_devices
