@@ -3,15 +3,47 @@ import socket
 import threading
 import time
 import json
+import argparse
+import sys
 from datetime import datetime
-import gi
 
-gi.require_version('Gst', '1.0')
-gi.require_version('GstVideo', '1.0')
-from gi.repository import Gst, GObject, GLib
+# Імпорти для відео (опціонально)
+try:
+    import gi
+    gi.require_version('Gst', '1.0')
+    gi.require_version('GstVideo', '1.0')
+    from gi.repository import Gst, GObject, GLib
+    Gst.init(None)
+    GST_AVAILABLE = True
+except ImportError:
+    GST_AVAILABLE = False
+    print("[WARN] GStreamer не доступний - відео функції вимкнені")
 
-# Ініціалізація GStreamer
-Gst.init(None)
+# Імпорти для TX12 контролера (опціонально)
+try:
+    from evdev import InputDevice, categorize, ecodes, list_devices
+    EVDEV_AVAILABLE = True
+except ImportError:
+    EVDEV_AVAILABLE = False
+    print("[WARN] evdev не доступний - TX12 контролер вимкнений")
+
+# == CRSF Константи ==
+CRSF_ADDRESS = 0xC8
+CRSF_TYPE_RC_CHANNELS_PACKED = 0x16
+CRSF_CHANNEL_MIN = 172
+CRSF_CHANNEL_MID = 992
+CRSF_CHANNEL_MAX = 1811
+
+# == Налаштування ==
+CONFIG = {
+    'telemetry_port': 6970,
+    'video_port': 5600,
+    'command_port': 6969,
+    'camera_ip': '192.168.0.100',
+    'tx12_target_ip': '192.168.0.1',
+    'tx12_send_rate': 66,
+    'failsafe_timeout': 2.0
+}
 
 class CRSFTelemetryReceiver:
     def __init__(self):
@@ -46,7 +78,7 @@ class CRSFTelemetryReceiver:
         with self.lock:
             self.telemetry_data['last_update'] = time.time()
 
-            if packet_type == 0x02:
+            if packet_type == 0x02:  # GPS
                 if len(payload) >= 15:
                     self.telemetry_data['gps'] = {
                         'lat': int.from_bytes(payload[0:4], 'big', signed=True) / 1e7,
@@ -57,7 +89,7 @@ class CRSFTelemetryReceiver:
                         'fix': 1 if payload[14] >= 4 else 0
                     }
 
-            elif packet_type == 0x08:
+            elif packet_type == 0x08:  # Battery
                 if len(payload) >= 8:
                     voltage = int.from_bytes(payload[0:2], 'big') / 100
                     current = int.from_bytes(payload[2:4], 'big') / 100
@@ -71,7 +103,7 @@ class CRSFTelemetryReceiver:
                         'remaining': remaining
                     }
 
-            elif packet_type == 0x14:
+            elif packet_type == 0x14:  # Link Quality
                 if len(payload) >= 10:
                     uplink_rssi = payload[0] - 256 if payload[0] > 127 else payload[0]
                     uplink_lq = payload[1]
@@ -89,7 +121,7 @@ class CRSFTelemetryReceiver:
                         'downlink_snr': downlink_snr
                     }
 
-            elif packet_type == 0x1E:
+            elif packet_type == 0x1E:  # Attitude
                 if len(payload) >= 6:
                     roll = int.from_bytes(payload[0:2], 'big', signed=True) / 10000
                     pitch = int.from_bytes(payload[2:4], 'big', signed=True) / 10000  
@@ -101,7 +133,7 @@ class CRSFTelemetryReceiver:
                         'yaw': yaw
                     }
 
-            elif packet_type == 0x21:
+            elif packet_type == 0x21:  # Flight Mode
                 if len(payload) >= 1:
                     mode_byte = payload[0]
                     armed = bool(mode_byte & 0x01)
@@ -134,8 +166,8 @@ class CRSFTelemetryReceiver:
 
     def udp_listener(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.bind(("0.0.0.0", 6970))
-        print("[INFO] Listening for CRSF telemetry on port 6970")
+        sock.bind(("0.0.0.0", CONFIG['telemetry_port']))
+        print(f"[INFO] Listening for CRSF telemetry on port {CONFIG['telemetry_port']}")
 
         while True:
             try:
@@ -175,8 +207,8 @@ class VideoStreamer:
         self.textoverlay = None
 
     def create_pipeline(self):
-        pipeline_str = """
-        udpsrc port=5600 caps="application/x-rtp,encoding-name=H264" !
+        pipeline_str = f"""
+        udpsrc port={CONFIG['video_port']} caps="application/x-rtp,encoding-name=H264" !
         rtph264depay !
         h264parse !
         avdec_h264 !
@@ -219,6 +251,10 @@ class VideoStreamer:
         return True
 
     def start(self):
+        if not GST_AVAILABLE:
+            print("[WARN] GStreamer недоступний - відео вимкнено")
+            return False
+
         if not self.create_pipeline():
             return False
 
@@ -236,80 +272,6 @@ class VideoStreamer:
         if self.pipeline:
             self.pipeline.set_state(Gst.State.NULL)
 
-class GroundStation:
-    def __init__(self):
-        self.telemetry_receiver = CRSFTelemetryReceiver()
-        self.video_streamer = VideoStreamer(self.telemetry_receiver)
-
-    def send_stop_command(self):
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        try:
-            sock.sendto(b"STOP", ("192.168.0.10", 6969))
-            print("[INFO] STOP command sent to camera")
-        except Exception as e:
-            print(f"[ERROR] Failed to send STOP: {e}")
-        finally:
-            sock.close()
-
-    def interactive_console(self):
-        print("[INFO] Type 'stop' to send STOP command to camera")
-        while True:
-            cmd = input(">>> ").strip().lower()
-            if cmd == "stop":
-                self.send_stop_command()
-            elif cmd in ("exit", "quit"):
-                print("Exiting interactive console...")
-                break
-
-    def start(self):
-        print("[INFO] CRSF Ground Station starting...")
-        telemetry_thread = threading.Thread(target=self.telemetry_receiver.udp_listener, daemon=True)
-        telemetry_thread.start()
-
-        if not self.video_streamer.start():
-            print("[ERROR] Failed to start video")
-            return
-
-        print("[INFO] Video stream active")
-        print("[INFO] Telemetry receiver active")
-        print("[INFO] Press Ctrl+C to stop or type 'stop'")
-
-        console_thread = threading.Thread(target=self.interactive_console, daemon=True)
-        console_thread.start()
-
-        try:
-            loop = GLib.MainLoop()
-            loop.run()
-        except KeyboardInterrupt:
-            print("[INFO] Shutting down...")
-        finally:
-            self.video_streamer.stop()
-            print("[INFO] Ground Station stopped")
-
-if __name__ == "__main__":
-    ground_station = GroundStation()
-    ground_station.start()
-
-
-
-import socket
-import time
-import threading
-from evdev import InputDevice, categorize, ecodes, list_devices
-
-# == Configuration for RadioMaster TX12 ==
-UDP_IP = "192.168.0.100"
-UDP_PORT = 6969
-SEND_RATE_HZ = 66
-FAILSAFE_TIMEOUT = 2.0  # seconds
-
-# == CRSF constants ==
-CRSF_ADDRESS = 0xC8
-CRSF_TYPE_RC_CHANNELS_PACKED = 0x16
-CRSF_CHANNEL_MIN = 172
-CRSF_CHANNEL_MID = 992
-CRSF_CHANNEL_MAX = 1811
-
 class RadioMasterTX12Controller:
     def __init__(self):
         self.channels = [CRSF_CHANNEL_MID] * 16
@@ -319,12 +281,12 @@ class RadioMasterTX12Controller:
         self.dev = None
         
         self.axis_map = {
-            ecodes.ABS_X: 0,
-            ecodes.ABS_Y: 1,
-            ecodes.ABS_Z: 2,
-            ecodes.ABS_RZ: 3,
-            ecodes.ABS_RX: 4,
-            ecodes.ABS_RY: 5,
+            ecodes.ABS_X: 0,      # Aileron
+            ecodes.ABS_Y: 1,      # Elevator
+            ecodes.ABS_Z: 2,      # Throttle
+            ecodes.ABS_RZ: 3,     # Rudder
+            ecodes.ABS_RX: 4,     # AUX1
+            ecodes.ABS_RY: 5,     # AUX2
         }
 
         self.switch_map = {
@@ -338,16 +300,17 @@ class RadioMasterTX12Controller:
             ecodes.BTN_BASE2: 13,
         }
 
-        self.switch_states = {}
-
         self.expo_settings = {
-            0: 0.2,
-            1: 0.2,
-            2: 0.0,
-            3: 0.2,
+            0: 0.2,  # Aileron
+            1: 0.2,  # Elevator
+            2: 0.0,  # Throttle
+            3: 0.2,  # Rudder
         }
 
     def find_tx12_device(self):
+        if not EVDEV_AVAILABLE:
+            return None
+            
         target_names = ["TX12", "RADIOMASTER", "RADIOMASTER TX12", "FRSKY", "TARANIS", "JOYSTICK"]
 
         for path in list_devices():
@@ -413,31 +376,31 @@ class RadioMasterTX12Controller:
 
     def build_crsf_packet(self):
         payload = self.pack_crsf_channels(self.channels)
-        frame = bytearray([CRSF_ADDRESS, CRSF_TYPE_RC_CHANNELS_PACKED, len(payload)])
+        frame = bytearray([CRSF_ADDRESS, len(payload) + 2, CRSF_TYPE_RC_CHANNELS_PACKED])
         frame.extend(payload)
         frame.append(self.crsf_crc8(frame[2:]))
         return frame
 
     def apply_failsafe(self):
         print("⚠️  TX12 disconnected - Failsafe engaged")
-        self.channels[2] = CRSF_CHANNEL_MIN
-        for i in [0, 1, 3]:
+        self.channels[2] = CRSF_CHANNEL_MIN  # Throttle to min
+        for i in [0, 1, 3]:  # Center sticks
             self.channels[i] = CRSF_CHANNEL_MID
-        for i in range(4, 16):
+        for i in range(4, 16):  # AUX channels to min
             self.channels[i] = CRSF_CHANNEL_MIN
 
     def transmit_loop(self):
-        interval = 1.0 / SEND_RATE_HZ
+        interval = 1.0 / CONFIG['tx12_send_rate']
         packet_count = 0
         while self.running:
             start_time = time.time()
-            if time.time() - self.last_input > FAILSAFE_TIMEOUT:
+            if time.time() - self.last_input > CONFIG['failsafe_timeout']:
                 self.apply_failsafe()
             try:
                 packet = self.build_crsf_packet()
-                self.sock.sendto(packet, (UDP_IP, UDP_PORT))
+                self.sock.sendto(packet, (CONFIG['tx12_target_ip'], CONFIG['command_port']))
                 packet_count += 1
-                if packet_count % (SEND_RATE_HZ * 5) == 0:
+                if packet_count % (CONFIG['tx12_send_rate'] * 5) == 0:
                     print(f"📡 Sent {packet_count} packets")
             except Exception as e:
                 print(f"❌ Transmission error: {e}")
@@ -449,11 +412,7 @@ class RadioMasterTX12Controller:
         self.last_input = time.time()
         if event.type == ecodes.EV_ABS and event.code in self.axis_map:
             ch = self.axis_map[event.code]
-            invert = False
-            if event.code == ecodes.ABS_Y:
-                invert = True
-            elif event.code == ecodes.ABS_Z:
-                invert = False
+            invert = event.code == ecodes.ABS_Y  # Invert elevator
             self.channels[ch] = self.scale_axis(event.value, ch, invert)
         elif event.type == ecodes.EV_KEY and event.code in self.switch_map:
             ch = self.switch_map[event.code]
@@ -469,13 +428,11 @@ class RadioMasterTX12Controller:
         aux_channels = " ".join(f"AUX{i-3}:{self.channels[i]:4d}" for i in range(4, 8))
         print(f"\r{main_channels} | {aux_channels}", end="", flush=True)
 
-    def calibrate_sticks(self):
-        print("🎯 TX12 stick calibration...")
-        print("   Move all sticks to max/min and press Enter")
-        input("   Ready? Press Enter...")
-        print("✅ Calibration complete")
+    def start_controller(self):
+        if not EVDEV_AVAILABLE:
+            print("❌ evdev недоступний - TX12 контролер не може бути запущений")
+            return False
 
-    def run(self):
         print("🚁 RadioMaster TX12 → CRSF UDP Bridge")
         print("=" * 50)
         self.dev = self.find_tx12_device()
@@ -485,15 +442,18 @@ class RadioMasterTX12Controller:
             print("   - TX12 is connected via USB")
             print("   - Joystick mode is enabled in settings")
             print("   - Permissions are correct (sudo or 'input' group)")
-            return
-        if input("Run calibration? (y/N): ").lower() == 'y':
-            self.calibrate_sticks()
-        print(f"📡 Transmitting to {UDP_IP}:{UDP_PORT} at {SEND_RATE_HZ}Hz")
+            return False
+
+        print(f"📡 Transmitting to {CONFIG['tx12_target_ip']}:{CONFIG['command_port']} at {CONFIG['tx12_send_rate']}Hz")
         print("📊 Display mode: A=Aileron E=Elevator T=Throttle R=Rudder")
-        print("🛑 Press Ctrl+C to stop")
+        
         self.running = True
         tx_thread = threading.Thread(target=self.transmit_loop, daemon=True)
         tx_thread.start()
+        
+        return True
+
+    def run_controller_loop(self):
         try:
             status_counter = 0
             for event in self.dev.read_loop():
@@ -505,14 +465,145 @@ class RadioMasterTX12Controller:
                     self.print_status()
                     status_counter = 0
         except KeyboardInterrupt:
-            print("\n🛑 Transmission stopped...")
+            print("\n🛑 Controller stopped...")
         except Exception as e:
-            print(f"\n❌ Error: {e}")
+            print(f"\n❌ Controller error: {e}")
         finally:
             self.running = False
+
+    def stop(self):
+        self.running = False
+        if self.sock:
             self.sock.close()
-            print("👋 Shutdown complete")
+
+class UnifiedGroundStation:
+    def __init__(self, enable_video=True, enable_tx12=False):
+        self.telemetry_receiver = CRSFTelemetryReceiver()
+        self.video_streamer = VideoStreamer(self.telemetry_receiver) if enable_video else None
+        self.tx12_controller = RadioMasterTX12Controller() if enable_tx12 else None
+        self.enable_video = enable_video
+        self.enable_tx12 = enable_tx12
+
+    def send_stop_command(self):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.sendto(b"STOP", (CONFIG['camera_ip'], CONFIG['command_port']))
+            print("[INFO] STOP command sent to camera")
+        except Exception as e:
+            print(f"[ERROR] Failed to send STOP: {e}")
+        finally:
+            sock.close()
+
+    def interactive_console(self):
+        print("\n[INFO] Interactive Console Commands:")
+        print("  'stop' - Send STOP command to camera")
+        print("  'telemetry' - Show current telemetry")
+        print("  'quit' or 'exit' - Exit program")
+        print("  'help' - Show this help")
+        
+        while True:
+            try:
+                cmd = input(">>> ").strip().lower()
+                if cmd == "stop":
+                    self.send_stop_command()
+                elif cmd == "telemetry":
+                    print("\n" + self.telemetry_receiver.get_telemetry_text() + "\n")
+                elif cmd == "help":
+                    print("\nCommands: stop, telemetry, quit, exit, help")
+                elif cmd in ("exit", "quit"):
+                    print("Exiting...")
+                    break
+                elif cmd == "":
+                    continue
+                else:
+                    print(f"Unknown command: {cmd}. Type 'help' for available commands.")
+            except (KeyboardInterrupt, EOFError):
+                print("\nExiting interactive console...")
+                break
+
+    def start(self):
+        print("🚁 Unified CRSF Ground Station")
+        print("=" * 50)
+        
+        # Запуск телеметрії
+        telemetry_thread = threading.Thread(target=self.telemetry_receiver.udp_listener, daemon=True)
+        telemetry_thread.start()
+        print("[INFO] Telemetry receiver started")
+
+        # Запуск відео
+        if self.enable_video and self.video_streamer:
+            if self.video_streamer.start():
+                print("[INFO] Video stream started")
+            else:
+                print("[WARN] Video stream failed to start")
+
+        # Запуск TX12 контролера
+        if self.enable_tx12 and self.tx12_controller:
+            if self.tx12_controller.start_controller():
+                print("[INFO] TX12 controller started")
+                tx12_thread = threading.Thread(target=self.tx12_controller.run_controller_loop, daemon=True)
+                tx12_thread.start()
+            else:
+                print("[WARN] TX12 controller failed to start")
+
+        # Запуск інтерактивної консолі
+        console_thread = threading.Thread(target=self.interactive_console, daemon=True)
+        console_thread.start()
+
+        print("\n[INFO] System ready!")
+        print("[INFO] Press Ctrl+C to stop")
+
+        try:
+            if self.enable_video and GST_AVAILABLE:
+                loop = GLib.MainLoop()
+                loop.run()
+            else:
+                # Якщо відео вимкнене, просто чекаємо
+                while True:
+                    time.sleep(1)
+        except KeyboardInterrupt:
+            print("\n[INFO] Shutting down...")
+        finally:
+            if self.video_streamer:
+                self.video_streamer.stop()
+            if self.tx12_controller:
+                self.tx12_controller.stop()
+            print("[INFO] Ground Station stopped")
+
+def main():
+    parser = argparse.ArgumentParser(description='Unified CRSF Ground Station and TX12 Controller')
+    parser.add_argument('--mode', choices=['groundstation', 'tx12', 'both'], default='groundstation',
+                       help='Operation mode (default: groundstation)')
+    parser.add_argument('--no-video', action='store_true', help='Disable video streaming')
+    parser.add_argument('--telemetry-port', type=int, default=6970, help='Telemetry port')
+    parser.add_argument('--video-port', type=int, default=5600, help='Video port')
+    parser.add_argument('--camera-ip', default='192.168.0.10', help='Camera IP address')
+    parser.add_argument('--tx12-ip', default='192.168.0.100', help='TX12 target IP address')
+    
+    args = parser.parse_args()
+    
+    # Оновлення конфігурації
+    CONFIG['telemetry_port'] = args.telemetry_port
+    CONFIG['video_port'] = args.video_port
+    CONFIG['camera_ip'] = args.camera_ip
+    CONFIG['tx12_target_ip'] = args.tx12_ip
+    
+    # Визначення режиму роботи
+    enable_video = not args.no_video and args.mode in ['groundstation', 'both']
+    enable_tx12 = args.mode in ['tx12', 'both']
+    
+    if args.mode == 'tx12' and not EVDEV_AVAILABLE:
+        print("❌ evdev не встановлено - неможливо запустити TX12 контролер")
+        print("Встановіть: pip install evdev")
+        sys.exit(1)
+        
+    if enable_video and not GST_AVAILABLE:
+        print("⚠️  GStreamer не встановлено - відео буде вимкнено")
+        enable_video = False
+    
+    # Запуск системи
+    station = UnifiedGroundStation(enable_video=enable_video, enable_tx12=enable_tx12)
+    station.start()
 
 if __name__ == "__main__":
-    controller = RadioMasterTX12Controller()
-    controller.run()
+    main()
