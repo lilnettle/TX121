@@ -1,120 +1,87 @@
 #!/usr/bin/env python3
 """
-Простий CRSF тест - відправляє пакети на всі знайдені порти
+Найпростіший тест - відправляємо сирі байти
 """
 
 import serial
 import time
-import os
 
-def find_all_ports():
-    """Знайти всі можливі порти"""
-    ports = []
-    # Всі можливі UART порти
-    candidates = [
-        "/dev/ttyUSB0", "/dev/ttyUSB1", "/dev/ttyUSB2", "/dev/ttyUSB3",
-        "/dev/ttyACM0", "/dev/ttyACM1", "/dev/ttyACM2", "/dev/ttyACM3",
-        "/dev/ttyS0", "/dev/ttyS1", "/dev/ttyS2", "/dev/ttyS3",
-        "/dev/ttyAMA0", "/dev/ttyAMA1", "/dev/ttyFIQ0"
-    ]
+def test_raw_data():
+    """Відправити прості тестові дані"""
     
-    for port in candidates:
-        if os.path.exists(port):
-            ports.append(port)
-            
-    return ports
-
-def create_simple_crsf_packet():
-    """Створити простий CRSF пакет"""
-    # Фіксований пакет з відомими значеннями
-    packet = bytearray([
-        0xC8,  # Sync byte
-        0x18,  # Length (24)
-        0x16,  # RC Channels type
-        # 22 байти payload (всі канали в центрі)
-        0x00, 0x04, 0x20, 0x00, 0x04, 0x20, 0x00, 0x04, 
-        0x20, 0x00, 0x04, 0x20, 0x00, 0x04, 0x20, 0x00, 
-        0x04, 0x20, 0x00, 0x04, 0x20, 0x00,
-        0x00   # CRC (спрощений)
-    ])
+    ports = ["/dev/ttyUSB0", "/dev/ttyFIQ0"]
     
-    # Простий CRC
-    crc = 0
-    for byte in packet[2:-1]:  # Від type до кінця payload
-        crc ^= byte
+    for port in ports:
+        print(f"\n🧪 Testing RAW data on {port}")
         
-    packet[-1] = crc
-    return bytes(packet)
+        try:
+            ser = serial.Serial(port, 115200, timeout=0.1)
+            
+            # Відправити прості байти
+            test_patterns = [
+                b'\xAA\x55\xAA\x55',  # Alternating pattern
+                b'\xFF\x00\xFF\x00',  # High/Low pattern  
+                b'\xC8\x18\x16\x00',  # CRSF header
+                b'HELLO_FC',          # Text
+            ]
+            
+            for i, pattern in enumerate(test_patterns):
+                print(f"   📡 Sending pattern {i+1}: {pattern.hex()}")
+                
+                # Відправити 50 разів
+                for _ in range(50):
+                    ser.write(pattern)
+                    time.sleep(0.02)
+                
+                time.sleep(1)
+            
+            ser.close()
+            print(f"   ✅ Raw test completed")
+            
+        except Exception as e:
+            print(f"   ❌ Failed: {e}")
 
-def test_port(port):
-    """Тест одного порту"""
+def test_loopback():
+    """Тест зворотнього зв'язку (якщо можливо)"""
+    
+    port = "/dev/ttyUSB0"
+    
+    print(f"\n🔄 Testing loopback on {port}")
+    
     try:
-        print(f"\n🧪 Testing {port}...")
+        ser = serial.Serial(port, 115200, timeout=0.5)
         
-        ser = serial.Serial(
-            port=port,
-            baudrate=115200,
-            timeout=0.1
-        )
+        # Відправити і спробувати прочитати
+        test_data = b"TEST_LOOPBACK"
         
-        packet = create_simple_crsf_packet()
+        ser.write(test_data)
+        time.sleep(0.1)
         
-        print(f"   ✅ Port opened")
-        print(f"   📡 Sending CRSF packets...")
+        received = ser.read(100)
         
-        # Відправити 100 пакетів
-        for i in range(100):
-            ser.write(packet)
-            time.sleep(0.02)  # 50 Hz
+        if received:
+            print(f"   📥 Received: {received}")
+        else:
+            print(f"   📭 No data received (normal for one-way)")
             
-        print(f"   📦 Sent 100 packets")
         ser.close()
-        return True
         
     except Exception as e:
-        print(f"   ❌ Failed: {e}")
-        return False
+        print(f"   ❌ Loopback failed: {e}")
 
 def main():
-    print("🚀 Simple CRSF Port Scanner")
-    print("=" * 40)
+    print("🔧 Raw UART Test")
+    print("=" * 30)
+    print("This will send simple patterns to test basic UART communication")
     
-    ports = find_all_ports()
+    test_raw_data()
+    test_loopback()
     
-    if not ports:
-        print("❌ No UART ports found!")
-        return
-        
-    print(f"📡 Found {len(ports)} ports:")
-    for port in ports:
-        print(f"   {port}")
-    
-    print(f"\n🧪 Testing each port...")
-    print(f"   Watch Betaflight Receiver tab for movement")
-    
-    working_ports = []
-    
-    for port in ports:
-        if test_port(port):
-            working_ports.append(port)
-            
-        # Пауза між тестами
-        time.sleep(1)
-    
-    print(f"\n📊 Results:")
-    print(f"   Working ports: {len(working_ports)}")
-    
-    if working_ports:
-        print(f"   ✅ Successfully tested:")
-        for port in working_ports:
-            print(f"      {port}")
-        print(f"\n💡 If any channels moved in Betaflight, that port works!")
-    else:
-        print(f"   ❌ No ports responded")
-        print(f"\n🔧 Check:")
-        print(f"      1. Physical wiring (TX→RX, GND→GND)")
-        print(f"      2. Betaflight Serial Rx configuration")
-        print(f"      3. Voltage levels (3.3V compatibility)")
+    print(f"\n💡 Next steps:")
+    print(f"   1. Check if FC receives ANY data (CLI: tasks)")
+    print(f"   2. Verify physical wiring")
+    print(f"   3. Check voltage levels")
+    print(f"   4. Try different UART pins on FC")
 
 if __name__ == "__main__":
     main()
