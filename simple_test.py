@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Ручний тест каналів - ви контролюєте значення з клавіатури
+Автоматичний тест - канали повинні рухатись самі
 """
 
 import serial
 import time
-import threading
+import math
 
 def generate_crc8_table():
     """Генерація CRC8 таблиці DVB-S2"""
@@ -60,113 +60,69 @@ def build_crsf_packet(channels, crc_table):
     
     return bytes(frame)
 
-class ChannelController:
-    def __init__(self):
-        self.channels = [992] * 16  # Центр
-        self.channels[2] = 172      # Throttle мінімум
-        self.running = True
-        
-    def print_controls(self):
-        print("\n🎮 Manual Channel Control")
-        print("=" * 40)
-        print("Controls:")
-        print("  w/s - Roll (Ch1)")
-        print("  a/d - Pitch (Ch2)")  
-        print("  q/e - Throttle (Ch3)")
-        print("  z/x - Yaw (Ch4)")
-        print("  r   - Reset all to center")
-        print("  ESC - Exit")
-        print("\nWatch Betaflight Receiver tab!")
-        
-    def update_channel(self, ch, delta):
-        """Оновити канал"""
-        self.channels[ch] = max(172, min(1811, self.channels[ch] + delta))
-        
-    def print_status(self):
-        """Показати поточні значення"""
-        print(f"\rRoll:{self.channels[0]:4d} Pitch:{self.channels[1]:4d} "
-              f"Throttle:{self.channels[2]:4d} Yaw:{self.channels[3]:4d}", end="", flush=True)
-
-def input_thread(controller):
-    """Потік для обробки введення"""
-    try:
-        while controller.running:
-            try:
-                key = input().strip().lower()
-                
-                if key == 'w':
-                    controller.update_channel(0, 50)  # Roll +
-                elif key == 's':
-                    controller.update_channel(0, -50) # Roll -
-                elif key == 'a':
-                    controller.update_channel(1, 50)  # Pitch +
-                elif key == 'd':
-                    controller.update_channel(1, -50) # Pitch -
-                elif key == 'q':
-                    controller.update_channel(2, 50)  # Throttle +
-                elif key == 'e':
-                    controller.update_channel(2, -50) # Throttle -
-                elif key == 'z':
-                    controller.update_channel(3, 50)  # Yaw +
-                elif key == 'x':
-                    controller.update_channel(3, -50) # Yaw -
-                elif key == 'r':
-                    controller.channels = [992] * 16  # Reset
-                    controller.channels[2] = 172      # Throttle мінімум
-                elif key == '' or key == 'exit':
-                    controller.running = False
-                    break
-                    
-            except EOFError:
-                controller.running = False
-                break
-            except:
-                pass
-                
-    except:
-        controller.running = False
-
 def main():
     port = "/dev/ttyUSB0"
+    
+    print("🌊 Channel Sweep Test")
+    print("=" * 30)
+    print("Channels should move automatically in Betaflight Receiver tab!")
     
     try:
         ser = serial.Serial(port, 115200, timeout=0.01)
         print(f"✅ UART opened: {port}")
         
-        controller = ChannelController()
-        controller.print_controls()
-        
-        # Запустити потік для введення
-        input_t = threading.Thread(target=input_thread, args=(controller,))
-        input_t.daemon = True
-        input_t.start()
-        
         crc_table = generate_crc8_table()
+        
+        start_time = time.time()
         packets_sent = 0
         
-        print(f"\n📡 Sending manual CRSF commands...")
-        
-        while controller.running:
+        while True:
+            current_time = time.time() - start_time
+            
+            # Базові канали (центр)
+            channels = [992] * 16
+            channels[2] = 172  # Throttle мінімум
+            
+            # Автоматичний рух каналів
+            # Roll (Ch1) - синус
+            channels[0] = int(992 + 300 * math.sin(current_time))
+            
+            # Pitch (Ch2) - косинус  
+            channels[1] = int(992 + 200 * math.cos(current_time * 1.5))
+            
+            # Yaw (Ch4) - треугольник
+            yaw_phase = (current_time * 0.5) % 2
+            if yaw_phase < 1:
+                channels[3] = int(992 + 250 * (yaw_phase * 2 - 1))
+            else:
+                channels[3] = int(992 + 250 * (2 - yaw_phase * 2))
+            
+            # Aux1 (Ch5) - квадратна хвиля
+            if int(current_time) % 2 == 0:
+                channels[4] = 1800
+            else:
+                channels[4] = 200
+            
             # Створити і відправити пакет
-            packet = build_crsf_packet(controller.channels, crc_table)
+            packet = build_crsf_packet(channels, crc_table)
             ser.write(packet)
             packets_sent += 1
             
-            # Показати статус кожні 50 пакетів
+            # Показувати значення кожні 50 пакетів
             if packets_sent % 50 == 0:
-                controller.print_status()
+                print(f"\r🎮 Roll:{channels[0]:4d} Pitch:{channels[1]:4d} "
+                      f"Yaw:{channels[3]:4d} Aux1:{channels[4]:4d} "
+                      f"Packets:{packets_sent:4d}", end="", flush=True)
             
-            time.sleep(0.01)  # 50 Hz
+            time.sleep(0.02)  # 50 Hz
             
     except KeyboardInterrupt:
-        print(f"\n⏹️  Stopped")
+        print(f"\n⏹️  Stopped after {packets_sent} packets")
     except Exception as e:
         print(f"❌ Error: {e}")
     finally:
         if 'ser' in locals():
             ser.close()
-            
-    print(f"\n📊 Sent {packets_sent} packets")
 
 if __name__ == "__main__":
     main()
