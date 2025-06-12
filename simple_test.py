@@ -1,231 +1,263 @@
 #!/usr/bin/env python3
 """
-Фінальний CRSF тест після правильного налаштування через CLI
+Адаптований CRSF тестер на основі робочого коду
+Використовує правильний алгоритм упаковки каналів
 """
 
 import serial
 import time
-import sys
+import argparse
+from enum import IntEnum
 
-def generate_crc8_table():
-    """Генерація CRC8 таблиці DVB-S2"""
-    table = []
-    for i in range(256):
-        crc = i
-        for _ in range(8):
-            if crc & 0x80:
-                crc = ((crc << 1) ^ 0xD5) & 0xFF
-            else:
-                crc = (crc << 1) & 0xFF
-        table.append(crc)
-    return table
+CRSF_SYNC = 0xC8
 
-def calculate_crc8(data, table):
-    """Розрахунок CRC8 DVB-S2"""
+class PacketsTypes(IntEnum):
+    RC_CHANNELS_PACKED = 0x16
+
+def crc8_dvb_s2(crc, a) -> int:
+    """Точний CRC8 DVB-S2 як в робочому коді"""
+    crc = crc ^ a
+    for ii in range(8):
+        if crc & 0x80:
+            crc = (crc << 1) ^ 0xD5
+        else:
+            crc = crc << 1
+    return crc & 0xFF
+
+def crc8_data(data) -> int:
+    """Розрахунок CRC8 для масиву байтів"""
     crc = 0
-    for byte in data:
-        crc = table[crc ^ byte]
+    for a in data:
+        crc = crc8_dvb_s2(crc, a)
     return crc
 
-def create_final_crsf_packet(roll=1500, pitch=1500, throttle=1000, yaw=1500):
-    """Створити фінальний правильний CRSF пакет"""
+def packCrsfToBytes(channels) -> bytes:
+    """ПРАВИЛЬНА упаковка каналів як в робочому коді"""
+    # channels is in CRSF format! (0-1984)
+    # Values are packed little-endianish such that bits BA987654321 -> 87654321, 00000BA9
+    # 11 bits per channel x 16 channels = 22 bytes
+    if len(channels) != 16:
+        raise ValueError('CRSF must have 16 channels')
     
-    # Конвертувати в CRSF діапазон (172-1811)
-    def to_crsf(val):
-        if val < 1000:
-            return 172
-        elif val > 2000:
-            return 1811
-        else:
-            return int(172 + (val - 1000) * (1811 - 172) / 1000)
+    result = bytearray()
+    destShift = 0
+    newVal = 0
     
-    channels = [
-        to_crsf(roll), to_crsf(pitch), to_crsf(throttle), to_crsf(yaw),
-        to_crsf(1500), to_crsf(1500), to_crsf(1500), to_crsf(1500),
-        to_crsf(1500), to_crsf(1500), to_crsf(1500), to_crsf(1500),
-        to_crsf(1500), to_crsf(1500), to_crsf(1500), to_crsf(1500)
-    ]
-    
-    # Упаковка каналів (176 біт = 22 байти)
-    payload = bytearray(22)
-    bit_offset = 0
-    
-    for channel in channels:
-        channel &= 0x7FF  # 11 біт
-        
-        # Записати біти в little-endian порядку (як в Betaflight)
-        for bit_idx in range(11):
-            if channel & (1 << bit_idx):
-                byte_idx = bit_offset // 8
-                bit_pos = bit_offset % 8
-                if byte_idx < 22:
-                    payload[byte_idx] |= (1 << bit_pos)
-            bit_offset += 1
-    
-    # Створити фрейм
-    frame = bytearray()
-    frame.append(0xC8)  # CRSF_ADDRESS_FLIGHT_CONTROLLER
-    frame.append(24)    # Frame Length (22 + 1 type + 1 crc)
-    frame.append(0x16)  # CRSF_FRAMETYPE_RC_CHANNELS_PACKED
-    frame.extend(payload)
-    
-    # CRC8
-    crc_table = generate_crc8_table()
-    crc = calculate_crc8(frame[2:], crc_table)
-    frame.append(crc)
-    
-    return bytes(frame), channels
+    for ch in channels:
+        # Put the low bits in any remaining dest capacity
+        newVal |= (ch << destShift) & 0xff
+        result.append(newVal)
 
-def check_cli_setup():
-    """Перевірити що CLI налаштування виконані"""
-    print("🔧 CLI SETUP VERIFICATION")
-    print("=" * 40)
-    print("Before running this test, make sure you executed in Betaflight CLI:")
-    print()
-    print("📋 Required CLI commands:")
-    print("   set serialrx_provider = CRSF")
-    print("   serial 1 64 115200 57600 0 420000")
-    print("   save")
-    print()
-    print("🔍 Then verify with:")
-    print("   get serialrx_provider")
-    print("   serial")
-    print()
-    
-    response = input("❓ Have you executed these CLI commands? (y/n): ")
-    if response.lower() != 'y':
-        print("❌ Please run CLI commands first!")
-        sys.exit(1)
-
-def test_crsf_final():
-    """Фінальний тест CRSF"""
-    
-    # Спробувати обидва можливі порти
-    ports_to_try = [
-        ("/dev/ttyUSB0", "USB0 - might be UART0"),
-        ("/dev/ttyUSB1", "USB1 - might be UART1"),
-        ("/dev/ttyACM0", "ACM0 - alternative USB"),
-    ]
-    
-    for port, description in ports_to_try:
-        print(f"\n🧪 Testing {port} ({description})")
-        print("-" * 40)
+        # Shift the high bits down and place them into the next dest byte
+        srcBitsLeft = 11 - 8 + destShift
+        newVal = ch >> (11 - srcBitsLeft)
         
-        try:
-            # Спробувати 420000 baud (CRSF швидкість)
-            ser = serial.Serial(port, 420000, timeout=0.01)
-            print(f"✅ Opened {port} at 420000 baud")
-            
-            print("📡 Sending CRSF test sequence...")
-            
-            # Тестова послідовність
-            test_sequence = [
-                (1000, 1500, 1000, 1500, "Roll MIN"),
-                (1500, 1500, 1000, 1500, "Center"),  
-                (2000, 1500, 1000, 1500, "Roll MAX"),
-                (1500, 1500, 1000, 1500, "Center"),
-                (1500, 1000, 1000, 1500, "Pitch MIN"),
-                (1500, 1500, 1000, 1500, "Center"),
-                (1500, 2000, 1000, 1500, "Pitch MAX"),
-                (1500, 1500, 1000, 1500, "Center"),
-            ]
-            
-            for roll, pitch, throttle, yaw, name in test_sequence:
-                packet, channels = create_final_crsf_packet(roll, pitch, throttle, yaw)
-                
-                print(f"  🎮 {name:10} | Roll:{channels[0]:4d} Pitch:{channels[1]:4d}")
-                
-                # Відправити пакет 100 разів (2 секунди)
-                for _ in range(100):
-                    ser.write(packet)
-                    time.sleep(0.02)
-                
-                time.sleep(0.5)  # Пауза між тестами
-            
-            ser.close()
-            
-            response = input(f"  ❓ Did you see channels moving in Receiver tab? (y/n): ")
-            if response.lower() == 'y':
-                print(f"  🎉 SUCCESS! CRSF working on {port}")
-                return True, port
-            else:
-                print(f"  ❌ No movement on {port}")
-                
-        except Exception as e:
-            print(f"  ❌ Failed to test {port}: {e}")
-    
-    return False, None
+        # When there's at least a full byte remaining, consume that as well
+        if srcBitsLeft >= 8:
+            result.append(newVal & 0xff)
+            newVal >>= 8
+            srcBitsLeft -= 8
 
-def main():
-    print("🚀 FINAL CRSF TEST")
-    print("=" * 50)
-    print("This test assumes you've configured Betaflight CLI properly")
-    
-    # Перевірити CLI налаштування
-    check_cli_setup()
-    
-    # Запустити фінальний тест
-    success, working_port = test_crsf_final()
-    
-    if success:
-        print(f"\n🎉 CRSF IS WORKING!")
-        print(f"   Working port: {working_port}")
-        print(f"   Baud rate: 420000")
-        print(f"   Protocol: CRSF")
-        print(f"\n✅ You can now use this setup for your FPV simulator!")
-        
-        # Запропонувати безперервний тест
-        cont = input(f"\n❓ Run continuous test? (y/n): ")
-        if cont.lower() == 'y':
-            run_continuous_test(working_port)
+        # Next dest should be shifted up by the bits consumed
+        destShift = srcBitsLeft
+
+    return result
+
+def channelsCrsfToChannelsPacket(channels) -> bytes:
+    """Створити CRSF пакет каналів"""
+    result = bytearray([CRSF_SYNC, 24, PacketsTypes.RC_CHANNELS_PACKED])  # 24 is packet length
+    result += packCrsfToBytes(channels)
+    result.append(crc8_data(result[2:]))
+    return result
+
+def pwm_to_crsf(pwm_value):
+    """Конвертувати PWM (1000-2000) в CRSF формат (172-1811)"""
+    if pwm_value < 1000:
+        return 172
+    elif pwm_value > 2000:
+        return 1811
     else:
-        print(f"\n❌ CRSF still not working")
-        print(f"\n🔍 Additional troubleshooting:")
-        print(f"   1. Double-check CLI commands")
-        print(f"   2. Verify physical UART1 connection")
-        print(f"   3. Try different FC UART ports")
-        print(f"   4. Check FC pinout diagram")
+        # Лінійна конверсія з правильним масштабуванням
+        return int(172 + (pwm_value - 1000) * (1811 - 172) / 1000)
 
-def run_continuous_test(port):
-    """Безперервний тест для перевірки"""
-    print(f"\n🎮 CONTINUOUS CRSF TEST on {port}")
+def test_crsf_connection():
+    """Тест CRSF підключення з різними швидкостями"""
+    
+    print("🚀 PROFESSIONAL CRSF TESTER")
+    print("=" * 40)
+    print("Using working CRSF implementation")
+    
+    # Швидкості для тестування
+    speeds_to_test = [
+        (921600, "High Speed"),
+        (420000, "Betaflight Default"),
+        (416666, "CRSF Rev10 Official"),
+        (400000, "CRSF Rev7 Official"),
+        (115200, "Standard Serial"),
+    ]
+    
+    ports_to_test = ["/dev/ttyUSB0", "/dev/ttyUSB1", "/dev/ttyACM0"]
+    
+    for port in ports_to_test:
+        print(f"\n🔌 Testing port: {port}")
+        
+        for speed, description in speeds_to_test:
+            print(f"\n📡 Testing {speed} baud ({description})")
+            
+            try:
+                ser = serial.Serial(port, speed, timeout=0.1)
+                print(f"  ✅ Opened {port} at {speed} baud")
+                
+                # Тестова послідовність з CRSF значеннями
+                test_sequence = [
+                    ([992, 992, 992, 992], "🟡 ALL CENTER"),
+                    ([172, 992, 992, 992], "🔴 ROLL MIN"),
+                    ([992, 992, 992, 992], "🟡 CENTER"),
+                    ([1811, 992, 992, 992], "🔴 ROLL MAX"),
+                    ([992, 992, 992, 992], "🟡 CENTER"),
+                    ([992, 172, 992, 992], "🟢 PITCH MIN"),
+                    ([992, 992, 992, 992], "🟡 CENTER"),
+                    ([992, 1811, 992, 992], "🟢 PITCH MAX"),
+                    ([992, 992, 992, 992], "🟡 CENTER"),
+                    ([992, 992, 992, 172], "🔵 YAW MIN"),
+                    ([992, 992, 992, 992], "🟡 CENTER"),
+                    ([992, 992, 992, 1811], "🔵 YAW MAX"),
+                    ([992, 992, 992, 992], "🟡 CENTER"),
+                ]
+                
+                for crsf_channels, name in test_sequence:
+                    # Заповнити всі 16 каналів
+                    full_channels = crsf_channels + [992] * (16 - len(crsf_channels))
+                    
+                    # Створити пакет з правильним алгоритмом
+                    packet = channelsCrsfToChannelsPacket(full_channels)
+                    
+                    print(f"    {name}")
+                    
+                    # Відправити пакет 50 разів (1 секунда)
+                    for _ in range(50):
+                        ser.write(packet)
+                        time.sleep(0.02)  # 50 Hz
+                    
+                    time.sleep(0.3)  # Пауза між тестами
+                
+                ser.close()
+                
+                response = input(f"  ❓ Did channels move at {speed} baud? (y/n): ")
+                if response.lower() == 'y':
+                    print(f"  🎉 SUCCESS! {description} works on {port}")
+                    return port, speed, description
+                else:
+                    print(f"  ❌ No movement at {speed} baud")
+                    
+            except Exception as e:
+                print(f"  ❌ Failed to test {port} at {speed}: {e}")
+        
+        print(f"  ⏭️ Next port...")
+    
+    return None, None, None
+
+def run_continuous_crsf_test(port, speed):
+    """Безперервний тест з PWM значеннями"""
+    
+    print(f"\n🎮 CONTINUOUS CRSF TEST")
+    print(f"Port: {port}, Speed: {speed}")
     print("Press Ctrl+C to stop")
     print("-" * 30)
     
     try:
-        ser = serial.Serial(port, 420000, timeout=0.01)
+        ser = serial.Serial(port, speed, timeout=0.01)
         cycle = 0
         
         while True:
             cycle += 1
             
-            # Цикл кожні 3 секунди
-            phase = (cycle // 150) % 4
+            # Цикл тестів кожні 3 секунди
+            phase = (cycle // 150) % 6
             
             if phase == 0:
-                packet, ch = create_final_crsf_packet(1000, 1500, 1000, 1500)
-                state = "ROLL_MIN "
+                # Roll test - PWM 1000 to 2000
+                pwm_roll = 1000 + (cycle % 150) * 1000 // 150
+                pwm_channels = [pwm_roll, 1500, 1100, 1500]
+                state = f"ROLL_SWEEP  {pwm_roll:4d}"
             elif phase == 1:
-                packet, ch = create_final_crsf_packet(2000, 1500, 1000, 1500)
-                state = "ROLL_MAX "
+                # Pitch test
+                pwm_pitch = 1000 + (cycle % 150) * 1000 // 150
+                pwm_channels = [1500, pwm_pitch, 1100, 1500]
+                state = f"PITCH_SWEEP {pwm_pitch:4d}"
             elif phase == 2:
-                packet, ch = create_final_crsf_packet(1500, 1000, 1000, 1500)
-                state = "PITCH_MIN"
+                # Yaw test
+                pwm_yaw = 1000 + (cycle % 150) * 1000 // 150
+                pwm_channels = [1500, 1500, 1100, pwm_yaw]
+                state = f"YAW_SWEEP   {pwm_yaw:4d}"
+            elif phase == 3:
+                # All minimum
+                pwm_channels = [1000, 1000, 1100, 1000]
+                state = "ALL_MIN     1000"
+            elif phase == 4:
+                # All maximum
+                pwm_channels = [2000, 2000, 1100, 2000]
+                state = "ALL_MAX     2000"
             else:
-                packet, ch = create_final_crsf_packet(1500, 2000, 1000, 1500)
-                state = "PITCH_MAX"
+                # Center
+                pwm_channels = [1500, 1500, 1100, 1500]
+                state = "CENTER      1500"
             
+            # Конвертувати PWM в CRSF
+            crsf_channels = [pwm_to_crsf(pwm) for pwm in pwm_channels]
+            crsf_channels.extend([992] * 12)  # Решта каналів в центр
+            
+            # Створити та відправити пакет
+            packet = channelsCrsfToChannelsPacket(crsf_channels)
             ser.write(packet)
             
             if cycle % 25 == 0:
-                print(f"\r🎮 {state} | R:{ch[0]:4d} P:{ch[1]:4d} T:{ch[2]:4d} Y:{ch[3]:4d} | "
-                      f"Cycle:{cycle:4d}", end="", flush=True)
+                print(f"\r🎮 {state} | CRSF: R={crsf_channels[0]:4d} P={crsf_channels[1]:4d} "
+                      f"T={crsf_channels[2]:4d} Y={crsf_channels[3]:4d} | Cycle:{cycle:5d}", 
+                      end="", flush=True)
             
-            time.sleep(0.02)
+            time.sleep(0.02)  # 50 Hz
             
     except KeyboardInterrupt:
-        print(f"\n⏹️  Continuous test stopped")
+        print(f"\n⏹️ Test stopped")
         ser.close()
+
+def main():
+    print("🔧 PROFESSIONAL CRSF TESTER")
+    print("=" * 50)
+    print("Based on working CRSF implementation")
+    print("Uses correct channel packing algorithm")
+    print()
+    print("Betaflight should be configured:")
+    print("  serialrx_provider = CRSF")
+    print("  serial 1 64 (UART1 as Serial RX)")
+    print()
+    
+    ready = input("❓ Ready to test? (y/n): ")
+    if ready.lower() != 'y':
+        return
+    
+    # Знайти робочу конфігурацію
+    working_port, working_speed, description = test_crsf_connection()
+    
+    if working_port:
+        print(f"\n🎉 CRSF IS WORKING!")
+        print(f"   Port: {working_port}")
+        print(f"   Speed: {working_speed} baud")
+        print(f"   Type: {description}")
+        print(f"\n✅ You can now build your FPV simulator!")
+        
+        # Безперервний тест
+        cont = input(f"\n❓ Run continuous test with sweeping channels? (y/n): ")
+        if cont.lower() == 'y':
+            run_continuous_crsf_test(working_port, working_speed)
+    else:
+        print(f"\n❌ CRSF not working on any configuration")
+        print(f"\n🔍 Final troubleshooting suggestions:")
+        print(f"   1. Physical UART1 connection (TX1/RX1 pins)")
+        print(f"   2. 3.3V logic levels (not 5V)")
+        print(f"   3. Different FC UART port")
+        print(f"   4. Check FC firmware supports CRSF")
 
 if __name__ == "__main__":
     main()
