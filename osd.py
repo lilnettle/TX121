@@ -250,123 +250,133 @@ class OSDManager:
         return '\n'.join(lines)
     
     def start_gstreamer(self):
-        """Запустити GStreamer pipeline"""
+        """Запустити GStreamer pipeline (адаптовано під ваш підхід)"""
         if self.gst_process:
             return
         
-        # Спочатку перевіримо доступність камери
-        logging.info(f"🔍 Testing camera connection: {self.camera_ip}")
-        
-        # GStreamer pipeline з покращеними налаштуваннями
-        pipeline = [
-            'gst-launch-1.0',
-            '-v',
-            # RTSP джерело з розширеними налаштуваннями
-            'rtspsrc', 
-            f'location=rtsp://{self.camera_ip}:554/stream',
-            'protocols=tcp',  # Використовувати TCP замість UDP
-            'latency=100',
-            'retry=3',
-            'timeout=5000000',  # 5 секунд timeout
-            'drop-on-latency=true', '!',
-            
-            # Депакування H.264
-            'rtph264depay', '!', 
-            'h264parse', '!',
-            
-            # Декодування (спробуємо апаратний декодер)
-            'queue', 'max-size-buffers=3', '!',
-            'v4l2h264dec', '!',  # Апаратний декодер (якщо доступний)
-            'videoconvert', '!',
-            
-            # Накладання тексту з покращеними налаштуваннями
-            'textoverlay',
-            f'text-file={self.osd_fifo}',
-            'valignment=top',
-            'halignment=left',
-            'font-desc="Monospace Bold 16"',
-            'color=0xFFFFFFFF',  # Білий текст
-            'outline-color=0xFF000000',  # Чорний контур
-            'line-alignment=left',
-            'silent=true',
-            'auto-resize=false', '!',
-            
-            # Масштабування
-            'videoscale', '!',
-            'video/x-raw,width=1920,height=1080,framerate=30/1', '!',
-            'videoconvert', '!',
-            
-            # Вивід на HDMI (спробуємо різні sink)
-            'autovideosink',  # Автоматичний вибір sink
-            'sync=false'
+        # Список pipeline варіантів (від простого до складного)
+        pipelines = [
+            # 1. Ваш підхід - простий і надійний
+            {
+                'name': 'Simple RTSP pipeline (your approach)',
+                'pipeline': [
+                    'gst-launch-1.0', '-v',
+                    'rtspsrc', f'location=rtsp://{self.camera_ip}:554/stream1',
+                    'latency=0', '!',
+                    'decodebin', '!',
+                    'videoconvert', '!',
+                    'kmssink'
+                ]
+            },
+            # 2. Ваш підхід + OSD
+            {
+                'name': 'Simple RTSP + OSD overlay',
+                'pipeline': [
+                    'gst-launch-1.0', '-v',
+                    'rtspsrc', f'location=rtsp://{self.camera_ip}:554/stream1',
+                    'latency=0', '!',
+                    'decodebin', '!',
+                    'videoconvert', '!',
+                    'textoverlay',
+                    f'text-file={self.osd_fifo}',
+                    'valignment=top', 'halignment=left',
+                    'font-desc="Monospace Bold 16"',
+                    'color=0xFFFFFFFF', 'outline-color=0xFF000000', '!',
+                    'kmssink'
+                ]
+            },
+            # 3. З автовибором sink
+            {
+                'name': 'Simple RTSP + OSD + autosink',
+                'pipeline': [
+                    'gst-launch-1.0', '-v',
+                    'rtspsrc', f'location=rtsp://{self.camera_ip}:554/stream1',
+                    'latency=0', '!',
+                    'decodebin', '!',
+                    'videoconvert', '!',
+                    'textoverlay',
+                    f'text-file={self.osd_fifo}',
+                    'valignment=top', 'halignment=left',
+                    'font-desc="Monospace Bold 16"',
+                    'color=0xFFFFFFFF', 'outline-color=0xFF000000', '!',
+                    'autovideosink'
+                ]
+            },
+            # 4. Альтернативний stream path
+            {
+                'name': 'Alternative stream path',
+                'pipeline': [
+                    'gst-launch-1.0', '-v',
+                    'rtspsrc', f'location=rtsp://{self.camera_ip}:554/stream',
+                    'latency=0', '!',
+                    'decodebin', '!',
+                    'videoconvert', '!',
+                    'textoverlay',
+                    f'text-file={self.osd_fifo}',
+                    'valignment=top', 'halignment=left',
+                    'font-desc="Monospace Bold 16"',
+                    'color=0xFFFFFFFF', 'outline-color=0xFF000000', '!',
+                    'autovideosink'
+                ]
+            }
         ]
         
-        # Альтернативний pipeline з програмним декодером
-        pipeline_fallback = [
-            'gst-launch-1.0',
-            '-v',
-            # RTSP джерело
-            'rtspsrc', 
-            f'location=rtsp://{self.camera_ip}:554/stream',
-            'protocols=tcp',
-            'latency=100', '!',
-            
-            # Депакування та декодування
-            'rtph264depay', '!', 
-            'h264parse', '!',
-            'avdec_h264', '!',  # Програмний декодер
-            'videoconvert', '!',
-            
-            # OSD
-            'textoverlay',
-            f'text-file={self.osd_fifo}',
-            'valignment=top',
-            'halignment=left',
-            'font-desc="Monospace Bold 16"',
-            'color=0xFFFFFFFF',
-            'outline-color=0xFF000000',
-            'silent=true', '!',
-            
-            # Вивід
-            'videoscale', '!',
-            'video/x-raw,width=1920,height=1080', '!',
-            'videoconvert', '!',
-            'autovideosink',
-            'sync=false'
-        ]
-        
-        try:
-            logging.info("🎬 Starting GStreamer pipeline (hardware decoder)...")
-            logging.info(f"📺 Camera: rtsp://{self.camera_ip}:554/stream")
-            
-            self.gst_process = subprocess.Popen(
-                pipeline,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                universal_newlines=True
-            )
-            
-            # Перевіримо чи процес запустився
-            time.sleep(3)
-            if self.gst_process.poll() is not None:
-                # Процес завершився, спробуємо fallback
-                logging.warning("⚠️  Hardware decoder failed, trying software decoder...")
+        # Спробуємо кожен pipeline
+        for i, config in enumerate(pipelines):
+            try:
+                logging.info(f"🎬 Trying pipeline {i+1}/4: {config['name']}")
+                
+                # Логуємо повну команду для налагодження
+                cmd_str = ' '.join(config['pipeline'])
+                logging.info(f"Command: {cmd_str}")
+                
                 self.gst_process = subprocess.Popen(
-                    pipeline_fallback,
+                    config['pipeline'],
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     universal_newlines=True
                 )
-            
-            self.running = True
-            logging.info("✅ GStreamer started")
-            
-            # Запустити моніторинг помилок
-            threading.Thread(target=self._monitor_gstreamer, daemon=True).start()
-            
-        except Exception as e:
-            logging.error(f"❌ Failed to start GStreamer: {e}")
-            self.gst_process = None
+                
+                # Чекаємо 3 секунди щоб побачити чи pipeline стабільний
+                time.sleep(3)
+                
+                if self.gst_process.poll() is None:
+                    # Процес ще працює - успіх!
+                    logging.info(f"✅ GStreamer started with: {config['name']}")
+                    self.running = True
+                    
+                    # Запустити моніторинг
+                    threading.Thread(target=self._monitor_gstreamer, daemon=True).start()
+                    
+                    # Якщо це pipeline без OSD, попередити користувача
+                    if 'OSD' not in config['name']:
+                        logging.warning("⚠️  Running without OSD overlay")
+                    
+                    return
+                else:
+                    # Процес завершився
+                    stderr_output = ""
+                    if self.gst_process.stderr:
+                        stderr_output = self.gst_process.stderr.read()
+                    logging.warning(f"❌ Pipeline {i+1} failed: {config['name']}")
+                    if stderr_output:
+                        logging.debug(f"Error details: {stderr_output[:300]}...")
+                    self.gst_process = None
+                    
+            except Exception as e:
+                logging.error(f"❌ Pipeline {i+1} exception: {e}")
+                if self.gst_process:
+                    try:
+                        self.gst_process.terminate()
+                    except:
+                        pass
+                    self.gst_process = None
+        
+        # Якщо всі pipeline провалилися
+        logging.error("❌ All GStreamer pipelines failed!")
+        logging.info("💡 Try testing manually:")
+        logging.info(f"   gst-launch-1.0 rtspsrc location=rtsp://{self.camera_ip}:554/stream1 latency=0 ! decodebin ! videoconvert ! kmssink")
+        self.gst_process = None
     
     def _monitor_gstreamer(self):
         """Моніторинг GStreamer процесу"""
