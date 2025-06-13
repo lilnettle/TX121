@@ -1,247 +1,155 @@
 #!/usr/bin/env python3
 """
-USB-UART детектор та тестер для CRSF bridge
-Допомагає ідентифікувати який порт для RX, а який для FC
+Швидкий CRSF Bridge: USB1 → USB0
+Без зайвих налаштувань, просто запустити
 """
 
 import serial
 import time
-import glob
 import threading
+import logging
 
-def detect_usb_ports():
-    """Знайти всі USB-UART порти"""
-    ports = sorted(glob.glob('/dev/ttyUSB*'))
-    return ports
+# Налаштування логування
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 
-def get_port_info(port):
-    """Отримати інформацію про порт"""
-    try:
-        # Спробувати різні швидкості
-        for baud in [420000, 115200, 57600, 9600]:
+class SimpleCRSFBridge:
+    def __init__(self):
+        self.rx_port = "/dev/ttyUSB1"  # RX приймач
+        self.fc_port = "/dev/ttyUSB0"  # FC
+        self.baud_rate = 420000
+        self.fallback_baud = 115200
+        
+        self.rx_serial = None
+        self.fc_serial = None
+        self.running = False
+        
+        self.stats = {'rx_packets': 0, 'fc_packets': 0, 'errors': 0}
+    
+    def connect(self):
+        """Підключитися з автоматичним fallback"""
+        for baud in [self.baud_rate, self.fallback_baud]:
             try:
-                ser = serial.Serial(port, baud, timeout=0.1)
-                ser.close()
-                return f"Available at {baud}"
-            except:
-                continue
-        return "No response"
-    except Exception as e:
-        return f"Error: {e}"
-
-def test_port_for_crsf(port, test_duration=5):
-    """Тестувати порт на наявність CRSF трафіку"""
-    print(f"🔍 Testing {port} for CRSF traffic...")
-    
-    crsf_packets = 0
-    total_bytes = 0
-    
-    for baud in [420000, 400000, 416666, 115200]:
-        try:
-            ser = serial.Serial(port, baud, timeout=0.1)
-            print(f"  📡 Listening at {baud} baud...")
-            
-            start_time = time.time()
-            buffer = bytearray()
-            
-            while time.time() - start_time < test_duration:
-                if ser.in_waiting > 0:
-                    data = ser.read(ser.in_waiting)
-                    buffer.extend(data)
-                    total_bytes += len(data)
-                    
-                    # Шукати CRSF пакети
-                    while len(buffer) >= 4:
-                        if buffer[0] == 0xC8:  # CRSF sync
-                            packet_len = buffer[1] + 2
-                            if packet_len <= len(buffer) and packet_len <= 64:
-                                # Можливий CRSF пакет
-                                packet = buffer[:packet_len]
-                                buffer = buffer[packet_len:]
-                                
-                                # Перевірити CRC
-                                if validate_crsf_crc(packet):
-                                    crsf_packets += 1
-                                    if packet[2] == 0x16:  # RC_CHANNELS_PACKED
-                                        print(f"    ✅ CRSF RC packet found!")
-                            else:
-                                buffer = buffer[1:]
-                        else:
-                            buffer = buffer[1:]
+                logging.info(f"🔌 Trying {baud} baud...")
                 
+                self.rx_serial = serial.Serial(self.rx_port, baud, timeout=0.01)
+                self.fc_serial = serial.Serial(self.fc_port, baud, timeout=0.01)
+                
+                logging.info(f"✅ Connected at {baud} baud")
+                logging.info(f"📡 Bridge: {self.rx_port} → {self.fc_port}")
+                return True
+                
+            except Exception as e:
+                logging.error(f"❌ Failed at {baud}: {e}")
+                self.disconnect()
+        
+        return False
+    
+    def disconnect(self):
+        """Відключити"""
+        if self.rx_serial:
+            self.rx_serial.close()
+            self.rx_serial = None
+        if self.fc_serial:
+            self.fc_serial.close()
+            self.fc_serial = None
+    
+    def bridge_thread(self):
+        """Головний потік bridge"""
+        logging.info("🔄 Bridge thread started")
+        
+        while self.running:
+            try:
+                # USB1 → USB0 (RX → FC)
+                if self.rx_serial.in_waiting > 0:
+                    data = self.rx_serial.read(self.rx_serial.in_waiting)
+                    self.fc_serial.write(data)
+                    self.stats['rx_packets'] += len(data)
+                
+                # USB0 → USB1 (FC → RX, телеметрія)
+                if self.fc_serial.in_waiting > 0:
+                    data = self.fc_serial.read(self.fc_serial.in_waiting)
+                    self.rx_serial.write(data)
+                    self.stats['fc_packets'] += len(data)
+                
+                time.sleep(0.001)  # 1ms
+                
+            except Exception as e:
+                logging.error(f"❌ Bridge error: {e}")
+                self.stats['errors'] += 1
                 time.sleep(0.01)
-            
-            ser.close()
-            
-            if crsf_packets > 0:
-                print(f"  🎯 Found {crsf_packets} CRSF packets at {baud} baud")
-                return baud, crsf_packets
-            elif total_bytes > 0:
-                print(f"  📊 {total_bytes} bytes received, but no valid CRSF")
-            else:
-                print(f"  ❌ No data at {baud} baud")
-                
-        except Exception as e:
-            print(f"  ❌ Error at {baud}: {e}")
     
-    return None, 0
-
-def validate_crsf_crc(packet):
-    """Перевірити CRC8 CRSF пакета"""
-    if len(packet) < 4:
-        return False
+    def stats_thread(self):
+        """Статистика"""
+        while self.running:
+            time.sleep(5)
+            logging.info(f"📊 RX→FC: {self.stats['rx_packets']} bytes | "
+                        f"FC→RX: {self.stats['fc_packets']} bytes | "
+                        f"Errors: {self.stats['errors']}")
     
-    crc = 0
-    for byte in packet[2:-1]:
-        crc = crc ^ byte
-        for _ in range(8):
-            if crc & 0x80:
-                crc = (crc << 1) ^ 0xD5
-            else:
-                crc = crc << 1
-        crc = crc & 0xFF
-    
-    return crc == packet[-1]
-
-def interactive_port_assignment():
-    """Інтерактивне призначення портів"""
-    ports = detect_usb_ports()
-    
-    if len(ports) < 2:
-        print(f"❌ Found only {len(ports)} USB port(s), need 2!")
-        print(f"Available: {ports}")
-        return None, None
-    
-    print(f"📋 USB-UART Port Detection Results:")
-    print("=" * 50)
-    
-    # Тестувати кожен порт
-    port_results = {}
-    for port in ports:
-        print(f"\n🔌 Testing {port}:")
-        baud, packets = test_port_for_crsf(port)
+    def start(self):
+        """Запустити bridge"""
+        if not self.connect():
+            return False
         
-        if packets > 0:
-            port_results[port] = {'type': 'RX_LIKELY', 'baud': baud, 'packets': packets}
-            print(f"  🎮 Likely RX receiver (found CRSF packets)")
-        else:
-            port_results[port] = {'type': 'FC_LIKELY', 'baud': None, 'packets': 0}
-            print(f"  🚁 Likely Flight Controller (no CRSF input)")
-    
-    # Автоматичне призначення
-    rx_port = None
-    fc_port = None
-    
-    for port, info in port_results.items():
-        if info['type'] == 'RX_LIKELY' and rx_port is None:
-            rx_port = port
-        elif info['type'] == 'FC_LIKELY' and fc_port is None:
-            fc_port = port
-    
-    # Fallback призначення
-    if rx_port is None:
-        rx_port = ports[0]
-    if fc_port is None:
-        fc_port = ports[1] if len(ports) > 1 else ports[0]
-    
-    print(f"\n🎯 RECOMMENDED ASSIGNMENT:")
-    print(f"  RX Receiver: {rx_port}")
-    print(f"  FC: {fc_port}")
-    
-    # Підтвердження користувачем
-    print(f"\n❓ Is this assignment correct?")
-    confirm = input("Press Enter to confirm, or 's' to swap: ").strip().lower()
-    
-    if confirm == 's':
-        rx_port, fc_port = fc_port, rx_port
-        print(f"🔄 Swapped: RX={rx_port}, FC={fc_port}")
-    
-    return rx_port, fc_port
-
-def quick_bridge_test(rx_port, fc_port):
-    """Швидкий тест bridge"""
-    print(f"\n🧪 QUICK BRIDGE TEST")
-    print(f"RX: {rx_port} → FC: {fc_port}")
-    
-    try:
-        # Відкрити обидва порти
-        rx_ser = serial.Serial(rx_port, 420000, timeout=0.1)
-        fc_ser = serial.Serial(fc_port, 420000, timeout=0.1)
+        self.running = True
         
-        print(f"✅ Both ports opened successfully")
+        # Запустити потоки
+        self.bridge_th = threading.Thread(target=self.bridge_thread, daemon=True)
+        self.stats_th = threading.Thread(target=self.stats_thread, daemon=True)
         
-        # Тест пересилання на 10 секунд
-        start_time = time.time()
-        packets_forwarded = 0
+        self.bridge_th.start()
+        self.stats_th.start()
         
-        while time.time() - start_time < 10:
-            # RX → FC
-            if rx_ser.in_waiting > 0:
-                data = rx_ser.read(rx_ser.in_waiting)
-                fc_ser.write(data)
-                packets_forwarded += len(data)
-            
-            # FC → RX (телеметрія)
-            if fc_ser.in_waiting > 0:
-                data = fc_ser.read(fc_ser.in_waiting)
-                rx_ser.write(data)
-            
-            time.sleep(0.001)
-        
-        rx_ser.close()
-        fc_ser.close()
-        
-        print(f"✅ Test completed: {packets_forwarded} bytes forwarded")
+        logging.info("🚀 Bridge running!")
         return True
-        
-    except Exception as e:
-        print(f"❌ Test failed: {e}")
-        return False
+    
+    def stop(self):
+        """Зупинити bridge"""
+        self.running = False
+        time.sleep(0.1)
+        self.disconnect()
+        logging.info("⏹️ Bridge stopped")
 
 def main():
-    print("🔧 USB-UART CRSF BRIDGE DETECTOR")
+    print("🌉 QUICK USB1→USB0 CRSF BRIDGE")
     print("=" * 40)
-    print("Automatically detects RX and FC ports")
+    print("Configuration:")
+    print("  RX Input:  /dev/ttyUSB1")
+    print("  FC Output: /dev/ttyUSB0")
+    print("  Direction: USB1 → USB0")
+    print("  Baud: 420000 (fallback to 115200)")
+    print()
     
-    # Знайти порти
-    ports = detect_usb_ports()
-    print(f"\n📋 Found {len(ports)} USB-UART adapter(s):")
-    for port in ports:
-        info = get_port_info(port)
-        print(f"  {port}: {info}")
-    
-    if len(ports) < 2:
-        print(f"\n❌ Need 2 USB-UART adapters, found {len(ports)}")
-        print(f"Please connect both RX receiver and FC via USB-UART adapters")
+    # Перевірити чи існують порти
+    import os
+    if not os.path.exists("/dev/ttyUSB0"):
+        print("❌ /dev/ttyUSB0 not found!")
+        return
+    if not os.path.exists("/dev/ttyUSB1"):
+        print("❌ /dev/ttyUSB1 not found!")
         return
     
-    # Інтерактивне призначення
-    rx_port, fc_port = interactive_port_assignment()
+    ready = input("❓ Start bridge? (y/n): ")
+    if ready.lower() != 'y':
+        return
     
-    if rx_port and fc_port:
-        # Швидкий тест
-        test_ok = quick_bridge_test(rx_port, fc_port)
-        
-        if test_ok:
-            print(f"\n✅ Ready to run CRSF bridge!")
-            print(f"Use these settings:")
-            print(f"  RX port: {rx_port}")
-            print(f"  FC port: {fc_port}")
-            print(f"  Baud: 420000 (with 115200 fallback)")
+    # Запустити bridge
+    bridge = SimpleCRSFBridge()
+    
+    try:
+        if bridge.start():
+            print("✅ Bridge running! Press Ctrl+C to stop")
+            print("📊 Statistics every 5 seconds")
             
-            # Запропонувати запуск
-            run_bridge = input(f"\n❓ Start CRSF bridge now? (y/n): ").strip().lower()
-            if run_bridge == 'y':
-                import subprocess
-                subprocess.run([
-                    "python3", "crsf_bridge.py", 
-                    "--rx-port", rx_port,
-                    "--fc-port", fc_port
-                ])
+            while True:
+                time.sleep(1)
         else:
-            print(f"\n❌ Bridge test failed, check connections")
-    else:
-        print(f"\n❌ Could not determine port assignment")
+            print("❌ Failed to start bridge")
+    
+    except KeyboardInterrupt:
+        print("\n🛑 Stopping...")
+        bridge.stop()
+        print("✅ Stopped")
 
 if __name__ == "__main__":
     main()
