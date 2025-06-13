@@ -583,7 +583,7 @@ def main():
     baud = int(input("UART baud [420000]: ").strip() or "420000")
     
     # RTSP конфігурація
-    default_rtsp = f"rtsp://{camera_ip}:554/stream"
+    default_rtsp = f"rtsp://root:12345@192.168.0.100:554/stream1"
     rtsp_url = input(f"RTSP URL [{default_rtsp}]: ").strip() or default_rtsp
     display_output = input("Display output [:0.0]: ").strip() or ":0.0"
     
