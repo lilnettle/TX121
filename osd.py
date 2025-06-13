@@ -254,43 +254,90 @@ class OSDManager:
         if self.gst_process:
             return
         
-        # GStreamer pipeline з RTSP, OSD накладанням та HDMI виводом
+        # Спочатку перевіримо доступність камери
+        logging.info(f"🔍 Testing camera connection: {self.camera_ip}")
+        
+        # GStreamer pipeline з покращеними налаштуваннями
         pipeline = [
             'gst-launch-1.0',
             '-v',
-            # RTSP джерело
-            f'rtspsrc', f'location=rtsp://{self.camera_ip}:554/stream', 'latency=50', '!',
-            'rtph264depay', '!',
+            # RTSP джерело з розширеними налаштуваннями
+            'rtspsrc', 
+            f'location=rtsp://{self.camera_ip}:554/stream',
+            'protocols=tcp',  # Використовувати TCP замість UDP
+            'latency=100',
+            'retry=3',
+            'timeout=5000000',  # 5 секунд timeout
+            'drop-on-latency=true', '!',
+            
+            # Депакування H.264
+            'rtph264depay', '!', 
             'h264parse', '!',
-            'avdec_h264', '!',
+            
+            # Декодування (спробуємо апаратний декодер)
+            'queue', 'max-size-buffers=3', '!',
+            'v4l2h264dec', '!',  # Апаратний декодер (якщо доступний)
             'videoconvert', '!',
             
-            # Накладання тексту
+            # Накладання тексту з покращеними налаштуваннями
             'textoverlay',
             f'text-file={self.osd_fifo}',
             'valignment=top',
             'halignment=left',
-            'font-desc="Monospace Bold 14"',
+            'font-desc="Monospace Bold 16"',
             'color=0xFFFFFFFF',  # Білий текст
             'outline-color=0xFF000000',  # Чорний контур
-            'silent=false',
+            'line-alignment=left',
+            'silent=true',
             'auto-resize=false', '!',
             
-            # Масштабування для HDMI
+            # Масштабування
+            'videoscale', '!',
+            'video/x-raw,width=1920,height=1080,framerate=30/1', '!',
+            'videoconvert', '!',
+            
+            # Вивід на HDMI (спробуємо різні sink)
+            'autovideosink',  # Автоматичний вибір sink
+            'sync=false'
+        ]
+        
+        # Альтернативний pipeline з програмним декодером
+        pipeline_fallback = [
+            'gst-launch-1.0',
+            '-v',
+            # RTSP джерело
+            'rtspsrc', 
+            f'location=rtsp://{self.camera_ip}:554/stream',
+            'protocols=tcp',
+            'latency=100', '!',
+            
+            # Депакування та декодування
+            'rtph264depay', '!', 
+            'h264parse', '!',
+            'avdec_h264', '!',  # Програмний декодер
+            'videoconvert', '!',
+            
+            # OSD
+            'textoverlay',
+            f'text-file={self.osd_fifo}',
+            'valignment=top',
+            'halignment=left',
+            'font-desc="Monospace Bold 16"',
+            'color=0xFFFFFFFF',
+            'outline-color=0xFF000000',
+            'silent=true', '!',
+            
+            # Вивід
             'videoscale', '!',
             'video/x-raw,width=1920,height=1080', '!',
             'videoconvert', '!',
-            
-            # Вивід на HDMI через kmssink
-            'kmssink',
-            'connector-id=32',  # Може потребувати налаштування
+            'autovideosink',
             'sync=false'
         ]
         
         try:
-            logging.info("🎬 Starting GStreamer pipeline...")
+            logging.info("🎬 Starting GStreamer pipeline (hardware decoder)...")
             logging.info(f"📺 Camera: rtsp://{self.camera_ip}:554/stream")
-            logging.info("🖥️  Output: HDMI via kmssink")
             
             self.gst_process = subprocess.Popen(
                 pipeline,
@@ -299,12 +346,56 @@ class OSDManager:
                 universal_newlines=True
             )
             
+            # Перевіримо чи процес запустився
+            time.sleep(3)
+            if self.gst_process.poll() is not None:
+                # Процес завершився, спробуємо fallback
+                logging.warning("⚠️  Hardware decoder failed, trying software decoder...")
+                self.gst_process = subprocess.Popen(
+                    pipeline_fallback,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    universal_newlines=True
+                )
+            
             self.running = True
             logging.info("✅ GStreamer started")
+            
+            # Запустити моніторинг помилок
+            threading.Thread(target=self._monitor_gstreamer, daemon=True).start()
             
         except Exception as e:
             logging.error(f"❌ Failed to start GStreamer: {e}")
             self.gst_process = None
+    
+    def _monitor_gstreamer(self):
+        """Моніторинг GStreamer процесу"""
+        if not self.gst_process:
+            return
+            
+        while self.running and self.gst_process:
+            try:
+                # Читаємо stderr для діагностики
+                if self.gst_process.stderr:
+                    line = self.gst_process.stderr.readline()
+                    if line:
+                        if "ERROR" in line or "CRITICAL" in line:
+                            logging.error(f"GStreamer: {line.strip()}")
+                        elif "WARNING" in line:
+                            logging.warning(f"GStreamer: {line.strip()}")
+                        else:
+                            logging.debug(f"GStreamer: {line.strip()}")
+                
+                # Перевіримо чи процес ще працює
+                if self.gst_process.poll() is not None:
+                    logging.error("❌ GStreamer process died!")
+                    break
+                    
+                time.sleep(0.1)
+                
+            except Exception as e:
+                logging.error(f"GStreamer monitor error: {e}")
+                break
     
     def stop_gstreamer(self):
         """Зупинити GStreamer"""
@@ -328,7 +419,7 @@ class EnhancedCRSFBridge:
     def __init__(self, camera_ip: str = "192.168.0.100"):
         # Базові налаштування bridge
         self.rx_port = "/dev/ttyUSB1"  # RX приймач
-        self.fc_port = "/dev/ttyUSB0"  # FC
+        self.fc_port = "/dev/ttyUSB0"  # FC (джерело телеметрії)
         self.baud_rate = 420000
         self.fallback_baud = 115200
         
@@ -336,7 +427,7 @@ class EnhancedCRSFBridge:
         self.fc_serial = None
         self.running = False
         
-        self.stats = {'rx_packets': 0, 'fc_packets': 0, 'errors': 0}
+        self.stats = {'rx_packets': 0, 'fc_packets': 0, 'errors': 0, 'telemetry_packets': 0}
         
         # OSD компоненти
         self.crsf_parser = CRSFParser()
@@ -372,8 +463,8 @@ class EnhancedCRSFBridge:
             self.fc_serial = None
     
     def bridge_thread(self):
-        """Головний потік bridge з парсингом телеметрії"""
-        logging.info("🔄 Bridge thread started")
+        """Головний потік bridge з парсингом телеметрії з USB0"""
+        logging.info("🔄 Bridge thread started (telemetry from: USB0)")
         
         while self.running:
             try:
@@ -383,16 +474,17 @@ class EnhancedCRSFBridge:
                     self.fc_serial.write(data)
                     self.stats['rx_packets'] += len(data)
                 
-                # USB0 → USB1 (FC → RX, телеметрія)
+                # USB0 → USB1 (FC → RX) + парсинг телеметрії з USB0
                 if self.fc_serial.in_waiting > 0:
                     data = self.fc_serial.read(self.fc_serial.in_waiting)
                     self.rx_serial.write(data)
                     self.stats['fc_packets'] += len(data)
                     
-                    # Парсинг телеметрії з FC
+                    # Парсинг телеметрії з USB0 (FC)
                     if self.crsf_parser.add_data(data):
                         self.osd_manager.update_telemetry(self.crsf_parser.telemetry)
                         self.last_telemetry_update = time.time()
+                        self.stats['telemetry_packets'] += 1
                 
                 time.sleep(0.001)  # 1ms
                 
@@ -410,14 +502,15 @@ class EnhancedCRSFBridge:
             
             logging.info(f"📊 RX→FC: {self.stats['rx_packets']} bytes | "
                         f"FC→RX: {self.stats['fc_packets']} bytes | "
+                        f"Telemetry: {self.stats['telemetry_packets']} packets | "
                         f"Errors: {self.stats['errors']}")
             
             if telemetry_age < 5:
-                logging.info(f"📡 Telemetry: {telem.voltage:.1f}V, "
-                           f"RSSI: {telem.rssi}, LQ: {telem.link_quality}%, "
+                logging.info(f"📡 Telemetry (USB0): {telem.voltage:.1f}V, "
+                           f"RSSI: {telem.rssi}dBm, LQ: {telem.link_quality}%, "
                            f"GPS: {telem.gps_sats} sats, Mode: {telem.flight_mode}")
             else:
-                logging.warning("⚠️  No recent telemetry data")
+                logging.warning("⚠️  No recent telemetry data from USB0")
     
     def start(self):
         """Запустити bridge та OSD"""
@@ -458,13 +551,17 @@ def main():
     print("Configuration:")
     print("  RX Input:     /dev/ttyUSB1")
     print("  FC Output:    /dev/ttyUSB0")
+    print("  Telemetry:    USB0 (Flight Controller)")
     print("  Camera IP:    192.168.0.100")
-    print("  Video Stream: RTSP → HDMI (kmssink)")
+    print("  Video Stream: RTSP → HDMI")
     print("  OSD:          CRSF Telemetry Overlay")
     print("  Baud:         420000 (fallback to 115200)")
     print()
     
-    # Перевірити чи існують порти
+    # Перевірити системні вимоги
+    print("🔍 Checking system requirements...")
+    
+    # Перевірити порти
     if not os.path.exists("/dev/ttyUSB0"):
         print("❌ /dev/ttyUSB0 not found!")
         return
@@ -472,10 +569,37 @@ def main():
         print("❌ /dev/ttyUSB1 not found!")
         return
     
+    # Перевірити GStreamer
+    try:
+        result = subprocess.run(['gst-launch-1.0', '--version'], 
+                              capture_output=True, text=True, timeout=5)
+        if result.returncode == 0:
+            print("✅ GStreamer found")
+        else:
+            print("❌ GStreamer not working properly")
+    except:
+        print("❌ GStreamer not found! Install: sudo apt install gstreamer1.0-tools gstreamer1.0-plugins-*")
+        return
+    
     # Налаштування камери
     camera_ip = input("📷 Camera IP (default: 192.168.0.100): ").strip()
     if not camera_ip:
         camera_ip = "192.168.0.100"
+    
+    # Тест камери
+    print(f"🔍 Testing camera connection to {camera_ip}...")
+    try:
+        import socket
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(3)
+        result = sock.connect_ex((camera_ip, 554))
+        sock.close()
+        if result == 0:
+            print("✅ Camera RTSP port reachable")
+        else:
+            print(f"⚠️  Camera RTSP port not reachable (continuing anyway)")
+    except:
+        print("⚠️  Could not test camera connection")
     
     ready = input("❓ Start bridge with OSD? (y/n): ")
     if ready.lower() != 'y':
@@ -487,8 +611,15 @@ def main():
     try:
         if bridge.start():
             print("✅ Enhanced Bridge running!")
-            print("📺 Video with OSD should appear on HDMI")
+            print("📺 Video with OSD should appear on display")
+            print("📡 Telemetry parsing from USB0")
             print("📊 Statistics every 5 seconds")
+            print()
+            print("💡 Troubleshooting:")
+            print("   - If no video: check camera IP and RTSP stream")
+            print("   - If no OSD: telemetry data may be missing")
+            print("   - Check logs for GStreamer errors")
+            print()
             print("Press Ctrl+C to stop")
             
             while True:
