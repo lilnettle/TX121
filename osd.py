@@ -153,6 +153,10 @@ class CleanVideoWithBridge:
         # Розпарсити роздільність
         self.width, self.height = map(int, resolution.split('x'))
         
+        # Додаткові параметри
+        self.port_range = "60000"
+        self.use_decodebin = True  # За замовчуванням використовуємо decodebin
+        
         # Bridge
         if self.enable_bridge:
             self.bridge = SimpleCRSFBridge(self.rx_port, self.fc_port, self.baud_rate)
@@ -161,26 +165,48 @@ class CleanVideoWithBridge:
     
     def create_gstreamer_pipeline(self):
         """Створити GStreamer pipeline"""
-        # Вибрати джерело відео з обробкою зависань
+        # Вибрати джерело відео з параметрами як у вашому скрипті
         if self.rtsp_input:
-            video_source = f"""
-            rtspsrc location={self.rtsp_input} 
-                latency=0 
-                drop-on-latency=true 
-                do-retransmission=false 
-                timeout=5000000
-                tcp-timeout=5000000
-                retry=3
-                protocols=tcp+udp-mcast+udp ! 
-            queue max-size-buffers=3 leaky=downstream ! 
-            rtph264depay ! 
-            queue max-size-buffers=3 leaky=downstream ! 
-            avdec_h264 max-threads=2 skip-frame=1 ! 
-            queue max-size-buffers=2 leaky=downstream ! 
-            videoscale ! 
-            video/x-raw,width={self.width},height={self.height} !
-            videoconvert !
-            """
+            if hasattr(self, 'use_decodebin') and self.use_decodebin:
+                # Використовуємо decodebin як у вашому скрипті
+                video_source = f"""
+                rtspsrc location={self.rtsp_input} 
+                    port-range={getattr(self, 'port_range', '60000')}
+                    latency=0 
+                    drop-on-latency=true 
+                    do-retransmission=false 
+                    timeout=5000000
+                    tcp-timeout=5000000
+                    retry=3
+                    protocols=tcp+udp-mcast+udp ! 
+                queue max-size-buffers=3 leaky=downstream ! 
+                decodebin ! 
+                queue max-size-buffers=2 leaky=downstream ! 
+                videoscale ! 
+                video/x-raw,width={self.width},height={self.height} !
+                videoconvert !
+                """
+            else:
+                # Стандартний H264 decoder
+                video_source = f"""
+                rtspsrc location={self.rtsp_input} 
+                    port-range={getattr(self, 'port_range', '60000')}
+                    latency=0 
+                    drop-on-latency=true 
+                    do-retransmission=false 
+                    timeout=5000000
+                    tcp-timeout=5000000
+                    retry=3
+                    protocols=tcp+udp-mcast+udp ! 
+                queue max-size-buffers=3 leaky=downstream ! 
+                rtph264depay ! 
+                queue max-size-buffers=3 leaky=downstream ! 
+                avdec_h264 max-threads=2 skip-frame=1 ! 
+                queue max-size-buffers=2 leaky=downstream ! 
+                videoscale ! 
+                video/x-raw,width={self.width},height={self.height} !
+                videoconvert !
+                """
         else:
             video_source = f"""
             videotestsrc pattern=ball is-live=true ! 
@@ -390,6 +416,8 @@ def main():
     parser.add_argument('-f', '--framerate', type=int, default=30, help='Frame rate')
     parser.add_argument('-w', '--windowed', action='store_true', help='Windowed mode (uses ximagesink)')
     parser.add_argument('--no-bridge', action='store_true', help='Disable bridge (video only)')
+    parser.add_argument('--port-range', default='60000', help='RTSP port range (default: 60000)')
+    parser.add_argument('--use-decodebin', action='store_true', help='Use decodebin instead of rtph264depay+avdec_h264')
     
     args = parser.parse_args()
     
@@ -407,6 +435,8 @@ def main():
         print("Bridge: DISABLED")
     print(f"Baud Rate: {args.baud}")
     print(f"Output: {'KMS' if not args.windowed else 'X11'} {args.resolution} @ {args.framerate}fps")
+    print(f"RTSP Port Range: {args.port_range}")
+    print(f"Decoder: {'decodebin' if args.use_decodebin else 'rtph264depay+avdec_h264'}")
     print(f"Mode: Clean video passthrough (NO OSD, NO telemetry parsing)")
     print()
     
@@ -439,6 +469,11 @@ def main():
     print("  📺 Clean video passthrough")
     print("  ⚡ Zero-latency KMS output")
     print("  🔄 Auto-recovery on video freeze")
+    print(f"  🔌 RTSP port-range={args.port_range}")
+    if args.use_decodebin:
+        print("  🎬 Universal decodebin decoder")
+    else:
+        print("  🎬 Optimized H264 decoder")
     if enable_bridge:
         print("  🌉 USB1→USB0 bridge (like your original script)")
         print("  📈 Bridge statistics in console")
@@ -446,7 +481,7 @@ def main():
     print("  🚫 NO telemetry parsing")
     print()
     
-    # Запустити систему
+    # Передати додаткові параметри
     system = CleanVideoWithBridge(
         rtsp_input=args.input,
         fc_port=args.fc_port,
@@ -457,6 +492,10 @@ def main():
         fullscreen=not args.windowed,
         enable_bridge=enable_bridge
     )
+    
+    # Додати додаткові параметри
+    system.port_range = args.port_range
+    system.use_decodebin = args.use_decodebin
     
     system.run()
 
