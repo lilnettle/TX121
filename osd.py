@@ -164,44 +164,61 @@ class CleanVideoWithBridge:
             self.bridge = None
     
     def create_gstreamer_pipeline(self):
-        """Створити GStreamer pipeline"""
-        # Вибрати джерело відео з параметрами як у вашому скрипті
+        """Створити GStreamer pipeline з оптимізаціями"""
+        
         if self.rtsp_input:
-            if hasattr(self, 'use_decodebin') and self.use_decodebin:
-                # Використовуємо decodebin як у вашому скрипті
+            # Отримати режим оптимізації
+            optimization_mode = getattr(self, 'optimization_mode', 'balanced')
+            
+            if optimization_mode == 'ultra_fast':
+                # Ультра швидкий режим - мінімум обробки
+                video_source = f"""
+                rtspsrc location={self.rtsp_input} 
+                    latency=0 
+                    protocols=tcp ! 
+                decodebin ! 
+                videoconvert !
+                """
+            elif optimization_mode == 'stable':
+                # Стабільний режим - більші буфери
                 video_source = f"""
                 rtspsrc location={self.rtsp_input} 
                     port-range={getattr(self, 'port_range', '60000')}
-                    latency=0 
-                    drop-on-latency=true 
-                    do-retransmission=false 
-                    timeout=5000000
-                    tcp-timeout=5000000
-                    retry=3
-                    protocols=tcp+udp-mcast+udp ! 
-                queue max-size-buffers=3 leaky=downstream ! 
+                    latency=100
+                    buffer-mode=auto
+                    protocols=tcp+udp ! 
+                queue max-size-buffers=10 leaky=upstream ! 
                 decodebin ! 
-                queue max-size-buffers=2 leaky=downstream ! 
+                queue max-size-buffers=5 leaky=upstream ! 
                 videoscale ! 
                 video/x-raw,width={self.width},height={self.height} !
                 videoconvert !
                 """
-            else:
-                # Стандартний H264 decoder
+            elif optimization_mode == 'low_latency':
+                # Низька затримка але стабільно
+                video_source = f"""
+                rtspsrc location={self.rtsp_input} 
+                    port-range={getattr(self, 'port_range', '60000')}
+                    latency=50
+                    drop-on-latency=true
+                    protocols=tcp ! 
+                queue max-size-buffers=2 leaky=downstream ! 
+                rtph264depay ! 
+                avdec_h264 max-threads=1 ! 
+                videoscale method=bilinear ! 
+                video/x-raw,width={self.width},height={self.height} !
+                videoconvert !
+                """
+            else:  # balanced
+                # Збалансований режим
                 video_source = f"""
                 rtspsrc location={self.rtsp_input} 
                     port-range={getattr(self, 'port_range', '60000')}
                     latency=0 
                     drop-on-latency=true 
-                    do-retransmission=false 
-                    timeout=5000000
-                    tcp-timeout=5000000
-                    retry=3
-                    protocols=tcp+udp-mcast+udp ! 
+                    protocols=tcp+udp ! 
                 queue max-size-buffers=3 leaky=downstream ! 
-                rtph264depay ! 
-                queue max-size-buffers=3 leaky=downstream ! 
-                avdec_h264 max-threads=2 skip-frame=1 ! 
+                decodebin ! 
                 queue max-size-buffers=2 leaky=downstream ! 
                 videoscale ! 
                 video/x-raw,width={self.width},height={self.height} !
@@ -214,22 +231,27 @@ class CleanVideoWithBridge:
             videoconvert !
             """
         
-        # Pipeline БЕЗ OSD - тільки чистий відеопотік
+        # Pipeline
         pipeline_str = video_source
         
-        # Додати буфер перед виходом
-        pipeline_str += "queue max-size-buffers=2 leaky=downstream !"
+        # Буфер перед виходом (залежить від режиму)
+        optimization_mode = getattr(self, 'optimization_mode', 'balanced')
+        if optimization_mode == 'ultra_fast':
+            pass  # Без додаткових буферів
+        elif optimization_mode == 'stable':
+            pipeline_str += "queue max-size-buffers=5 leaky=upstream !"
+        else:
+            pipeline_str += "queue max-size-buffers=2 leaky=downstream !"
         
-        # Вихід через KMS для мінімальної затримки
+        # Вихід
         if self.fullscreen:
             pipeline_str += f"""
             videoconvert ! 
             videoscale method=nearest-neighbour ! 
             video/x-raw,width={self.width},height={self.height} !
-            kmssink sync=false max-lateness=0 qos=false processing-deadline=0 render-delay=0 async=false
+            kmssink sync=false max-lateness=-1 qos=false processing-deadline=0 render-delay=0 async=false
             """
         else:
-            # Fallback для віконного режиму
             pipeline_str += f"""
             videoconvert ! 
             videoscale method=nearest-neighbour ! 
@@ -405,7 +427,7 @@ class CleanVideoWithBridge:
         return True
 
 def main():
-    parser = argparse.ArgumentParser(description='Clean Video + CRSF Bridge Control')
+    parser = argparse.ArgumentParser(description='Clean Video + CRSF Bridge Control - Optimized')
     parser.add_argument('-i', '--input', help='RTSP input URL')
     parser.add_argument('--fc-port', default='/dev/ttyUSB0', help='FC port (for bridge)')
     parser.add_argument('--rx-port', default='/dev/ttyUSB1', help='RX port (for control input)')
@@ -417,14 +439,15 @@ def main():
     parser.add_argument('-w', '--windowed', action='store_true', help='Windowed mode (uses ximagesink)')
     parser.add_argument('--no-bridge', action='store_true', help='Disable bridge (video only)')
     parser.add_argument('--port-range', default='60000', help='RTSP port range (default: 60000)')
-    parser.add_argument('--use-decodebin', action='store_true', help='Use decodebin instead of rtph264depay+avdec_h264')
+    parser.add_argument('--optimization', choices=['ultra_fast', 'low_latency', 'balanced', 'stable'], 
+                       default='balanced', help='Optimization mode')
     
     args = parser.parse_args()
     
     # Визначити режим
     enable_bridge = not args.no_bridge
     
-    print("🎬 CLEAN VIDEO + CRSF BRIDGE CONTROL")
+    print("🎬 OPTIMIZED CLEAN VIDEO + CRSF BRIDGE")
     print("=" * 50)
     print(f"Video Input: {args.input or 'Test Pattern'}")
     if enable_bridge:
@@ -436,8 +459,17 @@ def main():
     print(f"Baud Rate: {args.baud}")
     print(f"Output: {'KMS' if not args.windowed else 'X11'} {args.resolution} @ {args.framerate}fps")
     print(f"RTSP Port Range: {args.port_range}")
-    print(f"Decoder: {'decodebin' if args.use_decodebin else 'rtph264depay+avdec_h264'}")
-    print(f"Mode: Clean video passthrough (NO OSD, NO telemetry parsing)")
+    print(f"Optimization: {args.optimization.upper()}")
+    print()
+    
+    # Опис режимів оптимізації
+    optimization_descriptions = {
+        'ultra_fast': '⚡ ULTRA FAST - мінімум обробки, може бути нестабільно',
+        'low_latency': '🏎️ LOW LATENCY - швидко + стабільно',
+        'balanced': '⚖️ BALANCED - оптимальний баланс',
+        'stable': '🛡️ STABLE - максимальна стабільність, вища затримка'
+    }
+    print(f"Mode: {optimization_descriptions[args.optimization]}")
     print()
     
     if enable_bridge:
@@ -445,7 +477,6 @@ def main():
         print("This will pass control commands from RX to FC:")
         print(f"  • RX input: {args.rx_port}")
         print(f"  • FC output: {args.fc_port}")
-        print("  • Transparent passthrough like your original bridge")
         print("  • No OSD overlay on video")
         print("  • No telemetry parsing (performance optimized)")
         print()
@@ -460,28 +491,31 @@ def main():
             print("Connect your FC device or use --no-bridge")
             return
         
-        response = input("Continue with bridge enabled? (y/n): ")
-        if response.lower() != 'y':
-            print("Bridge disabled")
-            enable_bridge = False
+        if args.optimization == 'ultra_fast':
+            print("⚠️ WARNING: ultra_fast mode with bridge may cause issues")
+            response = input("Continue? (y/n): ")
+            if response.lower() != 'y':
+                return
+        else:
+            response = input("Continue with bridge enabled? (y/n): ")
+            if response.lower() != 'y':
+                print("Bridge disabled")
+                enable_bridge = False
     
     print("Features:")
-    print("  📺 Clean video passthrough")
+    print("  📺 Optimized video pipeline")
+    print(f"  🔧 {args.optimization.upper()} optimization mode")
     print("  ⚡ Zero-latency KMS output")
     print("  🔄 Auto-recovery on video freeze")
     print(f"  🔌 RTSP port-range={args.port_range}")
-    if args.use_decodebin:
-        print("  🎬 Universal decodebin decoder")
-    else:
-        print("  🎬 Optimized H264 decoder")
     if enable_bridge:
-        print("  🌉 USB1→USB0 bridge (like your original script)")
+        print("  🌉 USB1→USB0 bridge")
         print("  📈 Bridge statistics in console")
     print("  🚫 NO OSD overlay")
     print("  🚫 NO telemetry parsing")
     print()
     
-    # Передати додаткові параметри
+    # Запустити систему
     system = CleanVideoWithBridge(
         rtsp_input=args.input,
         fc_port=args.fc_port,
@@ -493,9 +527,9 @@ def main():
         enable_bridge=enable_bridge
     )
     
-    # Додати додаткові параметри
+    # Додати параметри оптимізації
     system.port_range = args.port_range
-    system.use_decodebin = args.use_decodebin
+    system.optimization_mode = args.optimization
     
     system.run()
 
