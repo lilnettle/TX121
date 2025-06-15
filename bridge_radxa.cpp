@@ -6,7 +6,6 @@
 #include <memory>
 #include <cstring>
 #include <csignal>
-#include <cerrno>
 #include <unistd.h>
 #include <fcntl.h>
 #include <termios.h>
@@ -18,204 +17,209 @@
 #include <gst/gst.h>
 #include <glib.h>
 
-// Конфігурація
+// Конфігурація - тільки 420000 baud
 const std::string RTSP_URL = "rtsp://root:12345@192.168.0.100:554/stream1";
-const int CRSF_BAUD = 420000;
-const std::string RX_PORT = "/dev/ttyUSB1";
-const std::string FC_PORT = "/dev/ttyUSB0";
+const std::string RX_PORT = "/dev/ttyUSB1";   // RX приймач
+const std::string FC_PORT = "/dev/ttyUSB0";   // FC
+const int CRSF_BAUD = 420000;  // Тільки цей baud
 
-// Оптимізований CRSF Bridge
-class OptimizedCRSFBridge {
+// Простий Serial Bridge (копія логіки Python)
+class SimpleCppBridge {
 private:
-    std::string rx_port, fc_port;
-    int baud_rate;
     int rx_fd = -1, fc_fd = -1;
     std::atomic<bool> running{false};
-    std::atomic<long> rx_packets{0}, fc_packets{0}, rx_bytes{0}, fc_bytes{0};
-    std::unique_ptr<std::thread> bridge_thread;
+    std::atomic<long> rx_bytes{0}, fc_bytes{0}, errors{0};
+    std::unique_ptr<std::thread> bridge_thread, stats_thread;
 
-    bool setup_serial_port(int fd, int baud) {
+    bool setup_custom_baud_420000(int fd) {
         struct termios tty;
-        memset(&tty, 0, sizeof(tty));
         
-        if (tcgetattr(fd, &tty) != 0) return false;
+        if (tcgetattr(fd, &tty) != 0) {
+            return false;
+        }
         
-        // Custom baud base
-        speed_t speed = B38400;
-        cfsetispeed(&tty, speed);
-        cfsetospeed(&tty, speed);
+        // Використовуємо B38400 як базу для custom baud
+        cfsetispeed(&tty, B38400);
+        cfsetospeed(&tty, B38400);
         
-        // 8N1, no flow control
-        tty.c_cflag &= ~PARENB;
-        tty.c_cflag &= ~CSTOPB;
+        // Базові налаштування 8N1
+        tty.c_cflag &= ~PARENB;   // No parity
+        tty.c_cflag &= ~CSTOPB;   // 1 stop bit
         tty.c_cflag &= ~CSIZE;
-        tty.c_cflag |= CS8;
-        tty.c_cflag &= ~CRTSCTS;
+        tty.c_cflag |= CS8;       // 8 bits
         tty.c_cflag |= CREAD | CLOCAL;
         
         // Raw mode
         tty.c_lflag &= ~(ICANON | ECHO | ECHOE | ISIG);
         tty.c_iflag &= ~(IXON | IXOFF | IXANY);
-        tty.c_iflag &= ~(IGNBRK | BRKINT | PARMRK | ISTRIP | INLCR | IGNCR | ICRNL);
         tty.c_oflag &= ~OPOST;
         
-        // Minimal timeout for ultra-low latency
+        // Короткий timeout
         tty.c_cc[VMIN] = 0;
-        tty.c_cc[VTIME] = 0;  // No timeout
+        tty.c_cc[VTIME] = 1;
         
-        if (tcsetattr(fd, TCSANOW, &tty) != 0) return false;
+        if (tcsetattr(fd, TCSANOW, &tty) != 0) {
+            return false;
+        }
         
-        // Custom baud rate setup
-        if (baud != 38400) {
-            struct serial_struct ss;
-            if (ioctl(fd, TIOCGSERIAL, &ss) == 0) {
-                ss.flags = (ss.flags & ~0x0030) | 0x0010;
-                ss.custom_divisor = ss.baud_base / baud;
-                ioctl(fd, TIOCSSERIAL, &ss);
+        // Встановити custom baud 420000
+        struct serial_struct ss;
+        if (ioctl(fd, TIOCGSERIAL, &ss) == 0) {
+            ss.flags = (ss.flags & ~0x0030) | 0x0010;  // ASYNC_SPD_CUST
+            ss.custom_divisor = ss.baud_base / 420000;
+            if (ioctl(fd, TIOCSSERIAL, &ss) == 0) {
+                std::cout << "✅ Custom baud 420000 set successfully\n";
+                return true;
+            } else {
+                std::cout << "❌ Failed to set custom baud 420000\n";
+                return false;
             }
         }
         
-        tcflush(fd, TCIOFLUSH);
+        return false;
+    }
+    
+    bool try_connect() {
+        std::cout << "🔌 Connecting at " << CRSF_BAUD << " baud...\n";
+        
+        // Відкрити порти
+        rx_fd = open(RX_PORT.c_str(), O_RDWR | O_NOCTTY);
+        if (rx_fd < 0) {
+            std::cout << "❌ Failed to open " << RX_PORT << "\n";
+            return false;
+        }
+        
+        fc_fd = open(FC_PORT.c_str(), O_RDWR | O_NOCTTY);
+        if (fc_fd < 0) {
+            std::cout << "❌ Failed to open " << FC_PORT << "\n";
+            close(rx_fd);
+            rx_fd = -1;
+            return false;
+        }
+        
+        // Налаштувати custom baud 420000
+        if (!setup_custom_baud_420000(rx_fd) || !setup_custom_baud_420000(fc_fd)) {
+            std::cout << "❌ Failed to configure 420000 baud\n";
+            close(rx_fd);
+            close(fc_fd);
+            rx_fd = fc_fd = -1;
+            return false;
+        }
+        
+        std::cout << "✅ Connected at " << CRSF_BAUD << " baud\n";
+        std::cout << "📡 Bridge: " << RX_PORT << " → " << FC_PORT << "\n";
         return true;
     }
 
     void bridge_loop() {
-        char rx_buffer[2048], fc_buffer[2048];
+        std::cout << "🔄 Bridge thread started\n";
         
-        // Set thread priority for real-time performance
-        struct sched_param param;
-        param.sched_priority = 50;
-        pthread_setschedparam(pthread_self(), SCHED_FIFO, &param);
+        char buffer[1024];
         
         while (running) {
-            bool activity = false;
-            
-            // RX → FC (Commands - highest priority)
-            if (rx_fd >= 0) {
-                ssize_t bytes = read(rx_fd, rx_buffer, sizeof(rx_buffer));
-                if (bytes > 0) {
-                    if (fc_fd >= 0) {
-                        write(fc_fd, rx_buffer, bytes);
-                    }
-                    rx_packets++;
-                    rx_bytes += bytes;
-                    activity = true;
+            try {
+                // USB1 → USB0 (RX → FC) - як у Python
+                ssize_t rx_available = read(rx_fd, buffer, sizeof(buffer));
+                if (rx_available > 0) {
+                    write(fc_fd, buffer, rx_available);
+                    rx_bytes += rx_available;
                 }
-            }
-            
-            // FC → RX (Telemetry)
-            if (fc_fd >= 0) {
-                ssize_t bytes = read(fc_fd, fc_buffer, sizeof(fc_buffer));
-                if (bytes > 0) {
-                    if (rx_fd >= 0) {
-                        write(rx_fd, fc_buffer, bytes);
-                    }
-                    fc_packets++;
-                    fc_bytes += bytes;
-                    activity = true;
+                
+                // USB0 → USB1 (FC → RX, телеметрія) - як у Python
+                ssize_t fc_available = read(fc_fd, buffer, sizeof(buffer));
+                if (fc_available > 0) {
+                    write(rx_fd, buffer, fc_available);
+                    fc_bytes += fc_available;
                 }
+                
+                // 1ms sleep як у Python
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                
+            } catch (...) {
+                errors++;
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
             }
-            
-            // Ultra-low latency sleep
-            if (!activity) {
-                std::this_thread::sleep_for(std::chrono::microseconds(100));
-            }
+        }
+    }
+    
+    void stats_loop() {
+        while (running) {
+            std::this_thread::sleep_for(std::chrono::seconds(5));
+            std::cout << "📊 RX→FC: " << rx_bytes.load() << " bytes | "
+                      << "FC→RX: " << fc_bytes.load() << " bytes | "
+                      << "Errors: " << errors.load() << "\n";
         }
     }
 
 public:
-    OptimizedCRSFBridge(const std::string& rx, const std::string& fc, int baud)
-        : rx_port(rx), fc_port(fc), baud_rate(baud) {}
-    
-    ~OptimizedCRSFBridge() { stop(); }
+    bool connect() {
+        // Тільки 420000 baud
+        return try_connect();
+    }
     
     bool start() {
-        std::cout << "🔌 Starting optimized CRSF bridge at " << baud_rate << " baud...\n";
-        
-        rx_fd = open(rx_port.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK);
-        if (rx_fd < 0) {
-            std::cerr << "❌ Failed to open RX port: " << rx_port << "\n";
-            return false;
-        }
-        
-        fc_fd = open(fc_port.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK);
-        if (fc_fd < 0) {
-            std::cerr << "❌ Failed to open FC port: " << fc_port << "\n";
-            close(rx_fd);
-            return false;
-        }
-        
-        if (!setup_serial_port(rx_fd, baud_rate) || !setup_serial_port(fc_fd, baud_rate)) {
-            stop();
+        if (!connect()) {
             return false;
         }
         
         running = true;
-        bridge_thread = std::make_unique<std::thread>(&OptimizedCRSFBridge::bridge_loop, this);
         
-        std::cout << "✅ Optimized bridge running\n";
-        std::cout << "🌉 " << rx_port << " ↔ " << fc_port << " @ " << baud_rate << " baud\n";
+        bridge_thread = std::make_unique<std::thread>(&SimpleCppBridge::bridge_loop, this);
+        stats_thread = std::make_unique<std::thread>(&SimpleCppBridge::stats_loop, this);
+        
+        std::cout << "🚀 Bridge running!\n";
         return true;
     }
     
     void stop() {
         running = false;
+        
         if (bridge_thread && bridge_thread->joinable()) {
             bridge_thread->join();
         }
+        if (stats_thread && stats_thread->joinable()) {
+            stats_thread->join();
+        }
+        
         if (rx_fd >= 0) { close(rx_fd); rx_fd = -1; }
         if (fc_fd >= 0) { close(fc_fd); fc_fd = -1; }
+        
+        std::cout << "⏹️ Bridge stopped\n";
     }
     
-    void print_stats() {
-        std::cout << "\r🌉 Bridge: Commands: " << rx_packets.load() << " (" << rx_bytes.load() << "B)"
-                  << " | Telemetry: " << fc_packets.load() << " (" << fc_bytes.load() << "B)    " << std::flush;
-    }
+    int get_baud() const { return CRSF_BAUD; }
 };
 
-// Оптимізований відеоплеєр
-class LowLatencyVideoPlayer {
+// Простий відеоплеєр
+class SimpleVideoPlayer {
 private:
     GstElement* playbin = nullptr;
     GMainLoop* loop = nullptr;
     std::atomic<bool> running{false};
 
     static gboolean bus_callback(GstBus* /*bus*/, GstMessage* message, gpointer data) {
-        LowLatencyVideoPlayer* self = static_cast<LowLatencyVideoPlayer*>(data);
+        SimpleVideoPlayer* self = static_cast<SimpleVideoPlayer*>(data);
         
         switch (GST_MESSAGE_TYPE(message)) {
             case GST_MESSAGE_ERROR: {
                 GError* err;
                 gchar* debug;
                 gst_message_parse_error(message, &err, &debug);
-                std::cout << "\n❌ Video Error: " << err->message << "\n";
+                std::cout << "❌ Video Error: " << err->message << "\n";
                 g_main_loop_quit(self->loop);
                 g_error_free(err);
                 g_free(debug);
                 break;
             }
-            case GST_MESSAGE_EOS:
-                std::cout << "\n📺 Video stream ended\n";
-                g_main_loop_quit(self->loop);
-                break;
             case GST_MESSAGE_STATE_CHANGED:
                 if (GST_MESSAGE_SRC(message) == GST_OBJECT(self->playbin)) {
                     GstState old_state, new_state;
                     gst_message_parse_state_changed(message, &old_state, &new_state, nullptr);
                     if (new_state == GST_STATE_PLAYING) {
-                        std::cout << "🎬 Low-latency video playing!\n";
+                        std::cout << "🎬 Video playing!\n";
                     }
                 }
                 break;
-            case GST_MESSAGE_BUFFERING: {
-                gint percent;
-                gst_message_parse_buffering(message, &percent);
-                // Force play even with low buffer for minimal latency
-                if (percent >= 10) {
-                    gst_element_set_state(self->playbin, GST_STATE_PLAYING);
-                }
-                break;
-            }
             default:
                 break;
         }
@@ -224,58 +228,22 @@ private:
 
 public:
     bool start(const std::string& uri) {
-        std::cout << "🎬 Starting low-latency video player...\n";
-        std::cout << "📡 Stream: " << uri << "\n";
-        
-        // Set environment for minimal latency
-        g_setenv("XDG_RUNTIME_DIR", "/tmp", TRUE);
+        std::cout << "🎬 Starting video...\n";
         
         playbin = gst_element_factory_make("playbin", "player");
-        if (!playbin) {
-            std::cout << "❌ Failed to create playbin\n";
-            return false;
-        }
+        if (!playbin) return false;
         
-        // Configure for ultra-low latency
-        g_object_set(G_OBJECT(playbin), 
-            "uri", uri.c_str(),
-            "flags", 0x00000001,  // Video only
-            "buffer-size", 512,   // Minimal buffer
-            "buffer-duration", (gint64)50000000,  // 50ms max
-            nullptr);
+        g_object_set(G_OBJECT(playbin), "uri", uri.c_str(), nullptr);
         
-        // Configure RTSP source for low latency
-        g_signal_connect(playbin, "source-setup", G_CALLBACK(+[](GstElement* /*playbin*/, GstElement* source, gpointer /*data*/) {
-            if (source && GST_IS_ELEMENT(source)) {
-                const gchar* factory_name = gst_plugin_feature_get_name(GST_PLUGIN_FEATURE(gst_element_get_factory(source)));
-                if (g_str_has_prefix(factory_name, "rtspsrc")) {
-                    g_object_set(source,
-                        "latency", 0,
-                        "drop-on-latency", TRUE,
-                        "do-retransmission", FALSE,
-                        "timeout", (guint64)2000000,  // 2 sec
-                        "tcp-timeout", (guint64)1000000,  // 1 sec
-                        nullptr);
-                }
-            }
-        }), nullptr);
-        
-        // Message handler
         GstBus* bus = gst_element_get_bus(playbin);
         gst_bus_add_watch(bus, bus_callback, this);
         gst_object_unref(bus);
         
-        // Start playing
         GstStateChangeReturn ret = gst_element_set_state(playbin, GST_STATE_PLAYING);
-        if (ret == GST_STATE_CHANGE_FAILURE) {
-            std::cout << "❌ Failed to start video\n";
-            return false;
-        }
+        if (ret == GST_STATE_CHANGE_FAILURE) return false;
         
         running = true;
         loop = g_main_loop_new(nullptr, FALSE);
-        
-        std::cout << "✅ Low-latency video ready\n";
         return true;
     }
     
@@ -301,45 +269,43 @@ public:
 };
 
 // Глобальні змінні
-static OptimizedCRSFBridge* global_bridge = nullptr;
-static LowLatencyVideoPlayer* global_player = nullptr;
+static SimpleCppBridge* global_bridge = nullptr;
+static SimpleVideoPlayer* global_player = nullptr;
 
 void signal_handler(int /*signal*/) {
-    std::cout << "\n🛑 Stopping optimized system...\n";
+    std::cout << "\n🛑 Stopping...\n";
     if (global_bridge) global_bridge->stop();
     if (global_player) global_player->stop();
     exit(0);
 }
 
 int main(int argc, char* argv[]) {
-    // Initialize
     gst_init(&argc, &argv);
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
     
-    // Set process priority
-    nice(-10);
+    std::cout << "🌉 SIMPLE C++ BRIDGE (Python Logic)\n";
+    std::cout << "====================================\n";
+    std::cout << "Configuration:\n";
+    std::cout << "  RX Input:  " << RX_PORT << "\n";
+    std::cout << "  FC Output: " << FC_PORT << "\n";
+    std::cout << "  Direction: USB1 → USB0\n";
+    std::cout << "  Baud: " << CRSF_BAUD << " (CRSF custom speed)\n";
+    std::cout << "  Video: " << RTSP_URL << "\n\n";
     
-    std::cout << "🚀 OPTIMIZED CLEAN VIDEO + CRSF BRIDGE\n";
-    std::cout << "======================================\n";
-    std::cout << "📡 RTSP: " << RTSP_URL << "\n";
-    std::cout << "⚡ CRSF: " << CRSF_BAUD << " baud (optimized)\n";
-    std::cout << "🌉 Bridge: " << RX_PORT << " ↔ " << FC_PORT << "\n";
-    std::cout << "🎯 Mode: Ultra-low latency\n\n";
-    
-    // Check ports
+    // Перевірити порти
     struct stat buffer;
     if (stat(RX_PORT.c_str(), &buffer) != 0) {
-        std::cout << "❌ RX port " << RX_PORT << " not found!\n";
+        std::cout << "❌ " << RX_PORT << " not found!\n";
         return 1;
     }
     if (stat(FC_PORT.c_str(), &buffer) != 0) {
-        std::cout << "❌ FC port " << FC_PORT << " not found!\n";
+        std::cout << "❌ " << FC_PORT << " not found!\n";
         return 1;
     }
     
-    // Start optimized bridge
-    OptimizedCRSFBridge bridge(RX_PORT, FC_PORT, CRSF_BAUD);
+    // Запустити bridge
+    SimpleCppBridge bridge;
     global_bridge = &bridge;
     
     if (!bridge.start()) {
@@ -347,8 +313,8 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     
-    // Start low-latency video
-    LowLatencyVideoPlayer player;
+    // Запустити відео
+    SimpleVideoPlayer player;
     global_player = &player;
     
     if (!player.start(RTSP_URL)) {
@@ -357,22 +323,14 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     
-    // Status thread
-    std::thread status_thread([&bridge]() {
-        while (true) {
-            bridge.print_stats();
-            std::this_thread::sleep_for(std::chrono::seconds(1));
-        }
-    });
-    status_thread.detach();
-    
-    std::cout << "\n🎮 System ready! Enjoy low-latency FPV!\n";
+    std::cout << "✅ System running at " << bridge.get_baud() << " baud!\n";
+    std::cout << "📊 Statistics every 5 seconds\n";
     std::cout << "Press Ctrl+C to stop\n\n";
     
-    // Run main loop
+    // Головний цикл
     player.run();
     
-    // Cleanup
+    // Очищення
     bridge.stop();
     player.stop();
     
