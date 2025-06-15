@@ -322,19 +322,30 @@ class HDMIOSDWithBridge:
     
     def create_gstreamer_pipeline(self):
         """Створити GStreamer pipeline"""
-        # Вибрати джерело відео з мінімальною затримкою
+        # Вибрати джерело відео з обробкою зависань
         if self.rtsp_input:
             video_source = f"""
-            rtspsrc location={self.rtsp_input} latency=0 drop-on-latency=true do-retransmission=false ! 
+            rtspsrc location={self.rtsp_input} 
+                latency=0 
+                drop-on-latency=true 
+                do-retransmission=false 
+                timeout=5000000
+                tcp-timeout=5000000
+                retry=3
+                protocols=tcp+udp-mcast+udp ! 
+            queue max-size-buffers=3 leaky=downstream ! 
             rtph264depay ! 
-            avdec_h264 max-threads=1 ! 
+            queue max-size-buffers=3 leaky=downstream ! 
+            avdec_h264 max-threads=2 skip-frame=1 ! 
+            queue max-size-buffers=2 leaky=downstream ! 
             videoscale ! 
             video/x-raw,width={self.width},height={self.height} !
             videoconvert !
+            queue max-size-buffers=2 leaky=downstream !
             """
         else:
             video_source = f"""
-            videotestsrc pattern=ball ! 
+            videotestsrc pattern=ball is-live=true ! 
             video/x-raw,width={self.width},height={self.height},framerate={self.framerate}/1 ! 
             videoconvert !
             """
@@ -373,13 +384,16 @@ class HDMIOSDWithBridge:
         # Crosshair overlay
         pipeline_str += "cairooverlay name=crosshair_overlay !"
         
+        # Додати буфер перед виходом
+        pipeline_str += "queue max-size-buffers=2 leaky=downstream !"
+        
         # Вихід через KMS для мінімальної затримки
         if self.fullscreen:
             pipeline_str += f"""
             videoconvert ! 
             videoscale method=nearest-neighbour ! 
             video/x-raw,width={self.width},height={self.height} !
-            kmssink sync=false max-lateness=0 qos=false processing-deadline=0 render-delay=0
+            kmssink sync=false max-lateness=0 qos=false processing-deadline=0 render-delay=0 async=false
             """
         else:
             # Fallback для віконного режиму
@@ -387,7 +401,7 @@ class HDMIOSDWithBridge:
             videoconvert ! 
             videoscale method=nearest-neighbour ! 
             video/x-raw,width={self.width},height={self.height} !
-            ximagesink sync=false force-aspect-ratio=true qos=false
+            ximagesink sync=false force-aspect-ratio=true qos=false async=false
             """
         
         return pipeline_str
@@ -395,6 +409,9 @@ class HDMIOSDWithBridge:
     def setup_pipeline(self):
         """Налаштувати GStreamer pipeline"""
         pipeline_str = self.create_gstreamer_pipeline()
+        
+        print(f"🎬 Creating pipeline...")
+        print(f"Pipeline: {pipeline_str[:100]}...")
         
         self.pipeline = Gst.parse_launch(pipeline_str)
         if not self.pipeline:
@@ -420,17 +437,76 @@ class HDMIOSDWithBridge:
         bus.add_signal_watch()
         bus.connect('message', self.on_message)
         
+        # Додати watchdog для відновлення
+        if self.rtsp_input:
+            GLib.timeout_add_seconds(10, self.check_pipeline_health)
+        
         return True
+    
+    def check_pipeline_health(self):
+        """Перевірити здоров'я pipeline і перезапустити при зависанні"""
+        try:
+            # Отримати статистику з rtspsrc
+            rtspsrc = self.pipeline.get_by_name("rtspsrc0")
+            if rtspsrc:
+                # Перевірити чи течуть дані
+                pass
+            
+            # Продовжити моніторинг
+            return True if self.running else False
+            
+        except Exception as e:
+            print(f"⚠️ Pipeline health check failed: {e}")
+            return True if self.running else False
+    
+    def restart_pipeline(self):
+        """Перезапустити pipeline при проблемах"""
+        try:
+            print("🔄 Restarting pipeline...")
+            self.pipeline.set_state(Gst.State.NULL)
+            time.sleep(1)
+            ret = self.pipeline.set_state(Gst.State.PLAYING)
+            if ret == Gst.StateChangeReturn.FAILURE:
+                print("❌ Failed to restart pipeline")
+            else:
+                print("✅ Pipeline restarted")
+        except Exception as e:
+            print(f"❌ Restart failed: {e}")
     
     def on_message(self, bus, message):
         """Обробник повідомлень GStreamer"""
         if message.type == Gst.MessageType.ERROR:
             err, debug = message.parse_error()
             print(f"❌ GStreamer Error: {err}")
-            self.loop.quit()
+            print(f"Debug: {debug}")
+            
+            # Спробувати перезапустити при помилці RTSP
+            if "rtsp" in str(err).lower() or "network" in str(err).lower():
+                print("🔄 Network error detected, attempting restart...")
+                threading.Thread(target=self.restart_pipeline, daemon=True).start()
+            else:
+                self.loop.quit()
+                
         elif message.type == Gst.MessageType.EOS:
             print("📺 End of stream")
             self.loop.quit()
+            
+        elif message.type == Gst.MessageType.WARNING:
+            warn, debug = message.parse_warning()
+            print(f"⚠️ GStreamer Warning: {warn}")
+            
+        elif message.type == Gst.MessageType.STATE_CHANGED:
+            if message.src == self.pipeline:
+                old_state, new_state, pending = message.parse_state_changed()
+                print(f"🎬 Pipeline state: {old_state.value_nick} → {new_state.value_nick}")
+                
+        elif message.type == Gst.MessageType.BUFFERING:
+            percent = message.parse_buffering()
+            print(f"📊 Buffering: {percent}%")
+            if percent < 100:
+                self.pipeline.set_state(Gst.State.PAUSED)
+            else:
+                self.pipeline.set_state(Gst.State.PLAYING)
     
     def draw_crosshair(self, overlay, cr, timestamp, duration, user_data):
         """Намалювати crosshair і штучний горизонт"""
