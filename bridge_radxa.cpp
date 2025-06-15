@@ -12,6 +12,7 @@
 #include <termios.h>
 #include <sys/stat.h>
 #include <sys/ioctl.h>
+#include <linux/serial.h>
 
 // GStreamer
 #include <gst/gst.h>
@@ -29,8 +30,8 @@ const std::string FC_PORT = "/dev/ttyUSB0";  // FC контролер
 // Структура статистики bridge
 struct BridgeStats {
     std::atomic<bool> bridge_active{false};
-    std::atomic<int> rx_packets{0};
-    std::atomic<int> fc_packets{0};
+    std::atomic<long> rx_packets{0};
+    std::atomic<long> fc_packets{0};
 };
 
 // Простий CRSF Bridge клас з підтримкою нестандартних швидкостей
@@ -45,9 +46,9 @@ private:
     std::atomic<bool> running{false};
     
     struct {
-        std::atomic<int> rx_packets{0};
-        std::atomic<int> fc_packets{0};
-        std::atomic<int> errors{0};
+        std::atomic<long> rx_packets{0};
+        std::atomic<long> fc_packets{0};
+        std::atomic<long> errors{0};
     } stats;
     
     std::unique_ptr<std::thread> bridge_thread;
@@ -214,8 +215,8 @@ public:
                 
                 // Оновити статистику
                 bridge_stats.bridge_active = true;
-                bridge_stats.rx_packets = stats.rx_packets;
-                bridge_stats.fc_packets = stats.fc_packets;
+                bridge_stats.rx_packets = stats.rx_packets.load();
+                bridge_stats.fc_packets = stats.fc_packets.load();
                 
                 std::this_thread::sleep_for(std::chrono::microseconds(500)); // 0.5ms
                 
@@ -315,7 +316,7 @@ public:
     }
     
     // Обробник повідомлень GStreamer
-    static gboolean bus_callback(GstBus* bus, GstMessage* message, gpointer data) {
+    static gboolean bus_callback(GstBus* /*bus*/, GstMessage* message, gpointer data) {
         CleanVideoWithBridge* self = static_cast<CleanVideoWithBridge*>(data);
         
         switch (GST_MESSAGE_TYPE(message)) {
@@ -546,7 +547,7 @@ public:
 static CleanVideoWithBridge* global_system = nullptr;
 
 // Обробник сигналів
-void signal_handler(int signal) {
+void signal_handler(int /*signal*/) {
     std::cout << "\n🛑 Stopping system...\n";
     if (global_system) {
         global_system->stop();
