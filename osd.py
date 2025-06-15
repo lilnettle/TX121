@@ -341,7 +341,6 @@ class HDMIOSDWithBridge:
             videoscale ! 
             video/x-raw,width={self.width},height={self.height} !
             videoconvert !
-            queue max-size-buffers=2 leaky=downstream !
             """
         else:
             video_source = f"""
@@ -350,39 +349,8 @@ class HDMIOSDWithBridge:
             videoconvert !
             """
         
-        # Pipeline з OSD
+        # Pipeline БЕЗ OSD - тільки чистий відеопотік
         pipeline_str = video_source
-        
-        # Додати overlay елементи
-        overlays = [
-            # RSSI & Link Quality
-            ('rssi_overlay', 'RSSI: -- dBm\\nLQ: ---', 30, 40, 'left', 'top', 'Sans Bold 18', '0xFF00FF00'),
-            # Battery
-            ('battery_overlay', 'BATT: -.--V\\n--%', -30, 40, 'right', 'top', 'Sans Bold 18', '0xFF00FF00'),
-            # GPS
-            ('gps_overlay', 'GPS: -- SATs\\nALT: ---m', 30, -40, 'left', 'bottom', 'Sans Bold 16', '0xFF00FF00'),
-            # Attitude
-            ('attitude_overlay', 'PITCH: --°\\nROLL: --°\\nYAW: --°', -30, -40, 'right', 'bottom', 'Sans Bold 16', '0xFF00FF00'),
-            # Flight Mode
-            ('mode_overlay', 'MODE: UNKNOWN', 0, 80, 'center', 'top', 'Sans Bold 20', '0xFF00FFFF'),
-            # Bridge Status
-            ('bridge_overlay', 'BRIDGE: DISABLED', 0, 120, 'center', 'top', 'Sans Bold 16', '0xFFFFFF00'),
-            # RC Channels
-            ('rc_overlay', 'CH1-4: ---- ---- ---- ----', 0, -80, 'center', 'bottom', 'Sans Bold 14', '0xFFFFFF00'),
-        ]
-        
-        for name, text, x, y, h_align, v_align, font, color in overlays:
-            pipeline_str += f"""
-            textoverlay name={name}
-                text="{text}"
-                halignment={h_align} valignment={v_align}
-                x-absolute={x} y-absolute={y}
-                font-desc="{font}"
-                color={color} !
-            """
-        
-        # Crosshair overlay
-        pipeline_str += "cairooverlay name=crosshair_overlay !"
         
         # Додати буфер перед виходом
         pipeline_str += "queue max-size-buffers=2 leaky=downstream !"
@@ -410,7 +378,7 @@ class HDMIOSDWithBridge:
         """Налаштувати GStreamer pipeline"""
         pipeline_str = self.create_gstreamer_pipeline()
         
-        print(f"🎬 Creating pipeline...")
+        print(f"🎬 Creating clean video pipeline (no OSD)...")
         print(f"Pipeline: {pipeline_str[:100]}...")
         
         self.pipeline = Gst.parse_launch(pipeline_str)
@@ -418,19 +386,8 @@ class HDMIOSDWithBridge:
             print("❌ Failed to create pipeline")
             return False
         
-        # Отримати overlay елементи
-        overlay_names = ['rssi_overlay', 'battery_overlay', 'gps_overlay', 
-                        'attitude_overlay', 'mode_overlay', 'bridge_overlay', 'rc_overlay']
-        
-        for name in overlay_names:
-            overlay = self.pipeline.get_by_name(name)
-            if overlay:
-                self.text_overlays[name] = overlay
-        
-        # Crosshair
-        crosshair = self.pipeline.get_by_name('crosshair_overlay')
-        if crosshair:
-            crosshair.connect('draw', self.draw_crosshair)
+        # Без OSD елементів - тільки відео
+        self.text_overlays = {}
         
         # Message handler
         bus = self.pipeline.get_bus()
@@ -662,21 +619,16 @@ class HDMIOSDWithBridge:
     def print_status(self):
         """Статус системи"""
         while self.running:
-            current_time = time.time()
-            
-            # Статус зв'язку
-            link_status = "🟢 LINK" if current_time - self.telemetry.link_last_update < 5 else "🔴 NO LINK"
-            batt_status = f"🔋 {self.telemetry.voltage:.1f}V" if self.telemetry.voltage > 0 else "🔋 NO DATA"
-            gps_status = f"🛰️ {self.telemetry.satellites}" if self.telemetry.satellites > 0 else "🛰️ NO FIX"
             
             # Bridge статус
             if self.enable_bridge:
                 bridge_status = "🌉 ACTIVE" if self.telemetry.bridge_active else "🌉 INACTIVE"
+                bridge_stats = f"RX→FC: {self.telemetry.rx_packets} | FC→RX: {self.telemetry.fc_packets}"
             else:
                 bridge_status = "🌉 DISABLED"
+                bridge_stats = ""
             
-            print(f"\r{link_status} | {batt_status} | {gps_status} | {bridge_status} | "
-                  f"CH1-4: {self.telemetry.channels[0]} {self.telemetry.channels[1]} {self.telemetry.channels[2]} {self.telemetry.channels[3]}    ", 
+            print(f"\r📺 Clean Video | {bridge_status} | {bridge_stats}    ", 
                   end="", flush=True)
             
             time.sleep(2)
@@ -766,48 +718,36 @@ class HDMIOSDWithBridge:
         return True
 
 def main():
-    parser = argparse.ArgumentParser(description='CRSF HDMI OSD with Zero-Latency Bridge Control')
+    parser = argparse.ArgumentParser(description='Clean Video + CRSF Bridge Control')
     parser.add_argument('-i', '--input', help='RTSP input URL')
-    parser.add_argument('--fc-port', default='/dev/ttyUSB0', help='FC port (for telemetry)')
+    parser.add_argument('--fc-port', default='/dev/ttyUSB0', help='FC port (for bridge)')
     parser.add_argument('--rx-port', default='/dev/ttyUSB1', help='RX port (for control input)')
     parser.add_argument('-b', '--baud', type=int, default=420000, help='CRSF baud rate')
     parser.add_argument('-r', '--resolution', default='1920x1080', 
-                       choices=['1280x720', '1920x1080', '3840x2160', '2560x1440'],
+                       choices=['1280x720', '1920x1080', '3840x2160', '2560x1440', '640x480', '848x480'],
                        help='Output resolution')
     parser.add_argument('-f', '--framerate', type=int, default=30, help='Frame rate')
     parser.add_argument('-w', '--windowed', action='store_true', help='Windowed mode (uses ximagesink)')
-    parser.add_argument('--no-bridge', action='store_true', help='Disable bridge (OSD only)')
-    parser.add_argument('--osd-only', action='store_true', help='OSD only mode (alias for --no-bridge)')
+    parser.add_argument('--no-bridge', action='store_true', help='Disable bridge (video only)')
     
     args = parser.parse_args()
     
     # Визначити режим
-    enable_bridge = not (args.no_bridge or args.osd_only)
+    enable_bridge = not args.no_bridge
     
-    print("🎬 ZERO-LATENCY CRSF HDMI OSD WITH BRIDGE")
-    print("=" * 60)
+    print("🎬 CLEAN VIDEO + CRSF BRIDGE CONTROL")
+    print("=" * 50)
     print(f"Video Input: {args.input or 'Test Pattern'}")
-    print(f"FC Port: {args.fc_port} (telemetry)")
     if enable_bridge:
         print(f"RX Port: {args.rx_port} (control input)")
+        print(f"FC Port: {args.fc_port} (bridge output)")
         print(f"Bridge: {args.rx_port} → {args.fc_port}")
     else:
         print("Bridge: DISABLED")
     print(f"Baud Rate: {args.baud}")
     print(f"Output: {'KMS' if not args.windowed else 'X11'} {args.resolution} @ {args.framerate}fps")
-    print(f"Latency: ZERO (sync=false, latency=0)")
-    print(f"Mode: {'Windowed' if args.windowed else 'Fullscreen KMS'}")
+    print(f"Mode: Clean video passthrough (NO OSD, NO telemetry parsing)")
     print()
-    
-    if not args.windowed:
-        print("🚀 ZERO-LATENCY MODE")
-        print("Using KMS sink for direct hardware output:")
-        print("  • No X11 overhead")
-        print("  • Direct DRM/KMS access")
-        print("  • Hardware-accelerated scaling")
-        print("  • Minimal processing pipeline")
-        print("  • sync=false, max-lateness=0")
-        print()
     
     if enable_bridge:
         print("🌉 BRIDGE MODE ENABLED")
@@ -815,33 +755,34 @@ def main():
         print(f"  • RX input: {args.rx_port}")
         print(f"  • FC output: {args.fc_port}")
         print("  • Transparent passthrough like your original bridge")
-        print("  • No joystick/keyboard - just data forwarding")
+        print("  • No OSD overlay on video")
+        print("  • No telemetry parsing (performance optimized)")
         print()
         
         if not os.path.exists(args.rx_port):
             print(f"❌ RX port {args.rx_port} not found!")
-            print("Connect your RX device or use --osd-only")
+            print("Connect your RX device or use --no-bridge")
             return
             
         if not os.path.exists(args.fc_port):
             print(f"❌ FC port {args.fc_port} not found!")
-            print("Connect your FC device or use --osd-only")
+            print("Connect your FC device or use --no-bridge")
             return
         
         response = input("Continue with bridge enabled? (y/n): ")
         if response.lower() != 'y':
-            print("Bridge disabled for safety")
+            print("Bridge disabled")
             enable_bridge = False
     
     print("Features:")
-    print("  🎯 Crosshair + Artificial Horizon")
-    print("  📊 Real-time telemetry OSD")
+    print("  📺 Clean video passthrough")
+    print("  ⚡ Zero-latency KMS output")
+    print("  🔄 Auto-recovery on video freeze")
     if enable_bridge:
         print("  🌉 USB1→USB0 bridge (like your original script)")
-        print("  📈 Bridge statistics display")
-    if not args.windowed:
-        print("  ⚡ Zero-latency KMS output")
-    print("  📺 Professional video overlay")
+        print("  📈 Bridge statistics in console")
+    print("  🚫 NO OSD overlay")
+    print("  🚫 NO telemetry parsing")
     print()
     
     # Запустити систему
@@ -851,6 +792,21 @@ def main():
         rx_port=args.rx_port,
         baud_rate=args.baud,
         resolution=args.resolution,
+        framerate=args.framerate,
+        fullscreen=not args.windowed,
+        enable_bridge=enable_bridge
+    )
+    
+    system.run()
+
+if __name__ == "__main__":
+    main().resolution,
+        framerate=args.framerate,
+        fullscreen=not args.windowed,
+        enable_bridge=enable_bridge
+    )
+    
+    system.run().resolution,
         framerate=args.framerate,
         fullscreen=not args.windowed,
         enable_bridge=enable_bridge

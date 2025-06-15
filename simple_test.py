@@ -1,644 +1,818 @@
 #!/usr/bin/env python3
 """
-RADXA UDP Transmitter з GStreamer OSD
-Приймає CRSF з RX приймача, передає через UDP на IP камеру,
-запускає GStreamer для відображення RTSP потоку з телеметрією
+CRSF HDMI OSD з простим bridge управлінням
+- Відображає телеметрію на HDMI OSD
+- Пропускає керування: USB1 → USB0 (як bridge)
+- Без джойстиків - тільки прозоре перенаправлення
 """
 
+import gi
+gi.require_version('Gst', '1.0')
+from gi.repository import Gst, GLib, GObject
+
 import serial
-import socket
 import time
 import threading
-import logging
-import struct
-import json
-import subprocess
+import argparse
+import math
 import os
-import signal
-from pathlib import Path
+from dataclasses import dataclass
+from enum import IntEnum
 
-# Налаштування логування
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('radxa_transmitter.log'),
-        logging.StreamHandler()
-    ]
-)
+# Ініціалізація
+Gst.init(None)
 
-class RadxaUDPTransmitter:
-    def __init__(self, rx_port="/dev/ttyUSB1", camera_ip="192.168.1.100", 
-                 crsf_port=5000, telemetry_port=5001, baud=420000, 
-                 rtsp_url=None, display_output=":0.0"):
-        """
-        RADXA UDP передавач з GStreamer OSD
-        
-        Args:
-            rx_port: Порт RX приймача
-            camera_ip: IP адреса камери
-            crsf_port: UDP порт для CRSF пакетів
-            telemetry_port: UDP порт для телеметрії
-            baud: Швидкість UART
-            rtsp_url: RTSP URL камери (якщо None, то rtsp://camera_ip:554/stream)
-            display_output: Display output для GStreamer
-        """
-        self.rx_port = rx_port
-        self.camera_ip = camera_ip
-        self.crsf_port = crsf_port
-        self.telemetry_port = telemetry_port
-        self.baud = baud
-        self.rtsp_url = rtsp_url or f"rtsp://{camera_ip}:554/stream"
-        self.display_output = display_output
-        
-        self.rx_serial = None
-        self.crsf_socket = None
-        self.telemetry_socket = None
-        self.gstreamer_process = None
-        self.running = False
-        
-        self.stats = {
-            'crsf_sent': 0,
-            'telemetry_received': 0,
-            'errors': 0,
-            'start_time': None
-        }
-        
-        self.rx_buffer = bytearray()
-        
-        # OSD дані
-        self.osd_data = {
-            'voltage': 0.0,
-            'current': 0.0,
-            'battery_percent': 0,
-            'rssi': -100,
-            'link_quality': 0,
-            'armed': False,
-            'flight_mode': 'DISARMED',
-            'altitude': 0.0,
-            'speed': 0.0,
-            'timestamp': time.time()
-        }
-        
-        # Шляхи для OSD файлів
-        self.osd_dir = Path("/tmp/radxa_osd")
-        self.osd_dir.mkdir(exist_ok=True)
-        self.osd_json_path = self.osd_dir / "osd_data.json"
-        self.osd_overlay_path = self.osd_dir / "overlay.txt"
+# CRSF константи
+CRSF_SYNC = 0xC8
+
+class PacketsTypes(IntEnum):
+    GPS = 0x02
+    VARIO = 0x07
+    BATTERY_SENSOR = 0x08
+    BARO_ALT = 0x09
+    HEARTBEAT = 0x0B
+    VIDEO_TRANSMITTER = 0x0F
+    LINK_STATISTICS = 0x14
+    RC_CHANNELS_PACKED = 0x16
+    ATTITUDE = 0x1E
+    FLIGHT_MODE = 0x21
+    DEVICE_PING = 0x28
+    DEVICE_INFO = 0x29
+    PARAMETER_SETTINGS_ENTRY = 0x2B
+    PARAMETER_READ = 0x2C
+    PARAMETER_WRITE = 0x2D
+    RADIO_ID = 0x3A
+
+@dataclass
+class TelemetryData:
+    """Структура телеметрії"""
+    # Link
+    rssi: int = -999
+    link_quality: int = 0
+    snr: int = 0
     
-    def connect(self):
-        """Підключитися до RX та створити UDP сокети"""
-        try:
-            # Підключення до RX
-            self.rx_serial = serial.Serial(self.rx_port, self.baud, timeout=0.01)
-            logging.info(f"✅ Connected to RX at {self.rx_port} @ {self.baud}")
-            
-            # UDP сокет для відправки CRSF
-            self.crsf_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            logging.info(f"✅ CRSF UDP socket created")
-            
-            # UDP сокет для отримання телеметрії
-            self.telemetry_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            self.telemetry_socket.bind(("0.0.0.0", self.telemetry_port))
-            self.telemetry_socket.settimeout(0.1)
-            logging.info(f"✅ Telemetry UDP socket bound to port {self.telemetry_port}")
-            
-            return True
-            
-        except Exception as e:
-            logging.error(f"❌ Connection failed: {e}")
-            self.disconnect()
-            return False
+    # Battery
+    voltage: float = 0.0
+    current: float = 0.0
+    battery_percent: int = 0
     
-    def disconnect(self):
-        """Відключити всі з'єднання"""
-        if self.rx_serial:
-            self.rx_serial.close()
-            self.rx_serial = None
-            
-        if self.crsf_socket:
-            self.crsf_socket.close()
-            self.crsf_socket = None
-            
-        if self.telemetry_socket:
-            self.telemetry_socket.close()
-            self.telemetry_socket = None
-        
-        self.stop_gstreamer()
-        logging.info("🔌 Disconnected")
+    # GPS
+    latitude: float = 0.0
+    longitude: float = 0.0
+    altitude: float = 0.0
+    satellites: int = 0
+    ground_speed: float = 0.0
     
-    def validate_crsf_packet(self, packet):
-        """Перевірити валідність CRSF пакета"""
-        if len(packet) < 4:
-            return False
-            
-        if packet[0] != 0xC8:
-            return False
-            
-        expected_len = packet[1] + 2
-        if len(packet) != expected_len:
-            return False
-            
-        # Перевірити CRC8
-        crc = 0
-        for byte in packet[2:-1]:
-            crc = self.crc8_dvb_s2(crc, byte)
-            
-        return crc == packet[-1]
+    # Attitude
+    pitch: float = 0.0
+    roll: float = 0.0
+    yaw: float = 0.0
     
-    def crc8_dvb_s2(self, crc, byte):
-        """CRC8 DVB-S2 для CRSF"""
-        crc = crc ^ byte
-        for _ in range(8):
+    # RC Channels (отримані від FC)
+    channels: list = None
+    
+    # Flight mode
+    flight_mode: str = "UNKNOWN"
+    
+    # Bridge status
+    bridge_active: bool = False
+    rx_packets: int = 0
+    fc_packets: int = 0
+    
+    # Timestamps
+    last_update: float = 0.0
+    link_last_update: float = 0.0
+    battery_last_update: float = 0.0
+    gps_last_update: float = 0.0
+    
+    def __post_init__(self):
+        if self.channels is None:
+            self.channels = [1500] * 16
+
+class CRSFParser:
+    """CRSF парсер для телеметрії"""
+    
+    @staticmethod
+    def crc8_dvb_s2(crc, a) -> int:
+        crc = crc ^ a
+        for ii in range(8):
             if crc & 0x80:
                 crc = (crc << 1) ^ 0xD5
             else:
                 crc = crc << 1
         return crc & 0xFF
-    
-    def parse_crsf_packets(self, buffer):
-        """Витягти CRSF пакети з буфера"""
-        packets = []
-        
-        while len(buffer) >= 4:
-            # Знайти sync byte
-            sync_pos = -1
-            for i in range(len(buffer)):
-                if buffer[i] == 0xC8:
-                    sync_pos = i
-                    break
-            
-            if sync_pos == -1:
-                buffer.clear()
-                break
-                
-            if sync_pos > 0:
-                buffer[:sync_pos] = []
-                continue
-                
-            if len(buffer) < 3:
-                break
-                
-            packet_len = buffer[1] + 2
-            if packet_len > 64 or packet_len < 4:
-                buffer[:1] = []
-                continue
-                
-            if len(buffer) < packet_len:
-                break
-                
-            packet = bytes(buffer[:packet_len])
-            buffer[:packet_len] = []
-            
-            if self.validate_crsf_packet(packet):
-                packets.append(packet)
-            else:
-                self.stats['errors'] += 1
-        
-        return packets
-    
-    def create_udp_packet(self, crsf_data):
-        """Створити UDP пакет з CRSF даними"""
-        timestamp = int(time.time() * 1000000)  # microseconds
-        packet_type = 0x01  # CRSF data
-        data_length = len(crsf_data)
-        
-        header = struct.pack('<QBH', timestamp, packet_type, data_length)
-        return header + crsf_data
-    
-    def parse_telemetry_packet(self, udp_data):
-        """Розпарсити телеметрію з UDP пакета"""
-        if len(udp_data) < 11:  # Мінімальний header
-            return None
-            
-        timestamp, packet_type, data_length = struct.unpack('<QBH', udp_data[:11])
-        
-        if packet_type == 0x02 and len(udp_data) >= 11 + data_length:  # Telemetry
-            return udp_data[11:11+data_length]
-        
-        return None
-    
-    def rx_to_udp_thread(self):
-        """Потік: RX → UDP (CRSF пакети)"""
-        logging.info("🔄 Started RX→UDP thread")
-        
-        while self.running:
-            try:
-                if self.rx_serial.in_waiting > 0:
-                    data = self.rx_serial.read(self.rx_serial.in_waiting)
-                    self.rx_buffer.extend(data)
-                    
-                    packets = self.parse_crsf_packets(self.rx_buffer)
-                    
-                    for packet in packets:
-                        # Створити UDP пакет та відправити на камеру
-                        udp_packet = self.create_udp_packet(packet)
-                        self.crsf_socket.sendto(udp_packet, (self.camera_ip, self.crsf_port))
-                        self.stats['crsf_sent'] += 1
-                        
-                        # Логувати RC пакети
-                        if len(packet) >= 3 and packet[2] == 0x16:
-                            logging.debug(f"📡 CRSF→UDP: RC packet to {self.camera_ip}:{self.crsf_port}")
-                
-                time.sleep(0.001)
-                
-            except Exception as e:
-                logging.error(f"❌ RX→UDP error: {e}")
-                self.stats['errors'] += 1
-                time.sleep(0.01)
-    
-    def udp_to_display_thread(self):
-        """Потік: UDP → Display (телеметрія для OSD)"""
-        logging.info("🔄 Started UDP→Display thread")
-        
-        while self.running:
-            try:
-                udp_data, addr = self.telemetry_socket.recvfrom(1024)
-                
-                telemetry_data = self.parse_telemetry_packet(udp_data)
-                if telemetry_data:
-                    self.stats['telemetry_received'] += 1
-                    
-                    # Обробити телеметрію для OSD
-                    self.process_telemetry_for_osd(telemetry_data)
-                    
-                    logging.debug(f"📡 Telemetry from {addr}: {len(telemetry_data)} bytes")
-                
-            except socket.timeout:
-                continue
-            except Exception as e:
-                logging.error(f"❌ UDP→Display error: {e}")
-                self.stats['errors'] += 1
-                time.sleep(0.01)
-    
-    def process_telemetry_for_osd(self, telemetry_data):
-        """Обробити телеметрію для OSD накладання"""
-        try:
-            # Розпарсити CRSF телеметрію
-            if len(telemetry_data) >= 4:
-                packet_type = telemetry_data[2]
-                self.osd_data['timestamp'] = time.time()
-                
-                if packet_type == 0x08:  # Battery
-                    if len(telemetry_data) >= 10:
-                        voltage = int.from_bytes(telemetry_data[3:5], 'big') / 10.0
-                        current = int.from_bytes(telemetry_data[5:7], 'big') / 10.0
-                        capacity = (telemetry_data[7] << 16) | (telemetry_data[8] << 8) | telemetry_data[9]
-                        percentage = telemetry_data[10] if len(telemetry_data) > 10 else 0
-                        
-                        self.osd_data.update({
-                            'voltage': voltage,
-                            'current': current,
-                            'capacity': capacity,
-                            'battery_percent': percentage
-                        })
-                
-                elif packet_type == 0x14:  # Link Statistics
-                    if len(telemetry_data) >= 12:
-                        rssi = self.signed_byte(telemetry_data[3])
-                        lq = telemetry_data[5]
-                        
-                        self.osd_data.update({
-                            'rssi': rssi,
-                            'link_quality': lq
-                        })
-                
-                elif packet_type == 0x02:  # GPS
-                    if len(telemetry_data) >= 15:
-                        lat = int.from_bytes(telemetry_data[3:7], 'big', signed=True) / 10000000.0
-                        lon = int.from_bytes(telemetry_data[7:11], 'big', signed=True) / 10000000.0
-                        speed = int.from_bytes(telemetry_data[11:13], 'big') / 100.0
-                        altitude = int.from_bytes(telemetry_data[13:15], 'big', signed=True) / 100.0
-                        
-                        self.osd_data.update({
-                            'latitude': lat,
-                            'longitude': lon,
-                            'speed': speed,
-                            'altitude': altitude
-                        })
-                
-                elif packet_type == 0x21:  # Flight mode
-                    if len(telemetry_data) >= 6:
-                        mode_byte = telemetry_data[3]
-                        armed_byte = telemetry_data[4]
-                        
-                        flight_modes = {
-                            0: 'MANUAL', 1: 'ACRO', 2: 'ANGLE', 3: 'HORIZON',
-                            4: 'GPS_HOLD', 5: 'GPS_HOME', 6: 'GPS_CRUISE'
-                        }
-                        
-                        self.osd_data.update({
-                            'flight_mode': flight_modes.get(mode_byte, f'MODE_{mode_byte}'),
-                            'armed': bool(armed_byte & 0x01)
-                        })
-                
-                # Оновити OSD файли
-                self.update_osd_files()
-        
-        except Exception as e:
-            logging.error(f"❌ OSD processing error: {e}")
-    
-    def signed_byte(self, b):
-        """Конвертувати в signed byte"""
-        return b - 256 if b >= 128 else b
-    
-    def update_osd_files(self):
-        """Оновити OSD файли для GStreamer"""
-        try:
-            # JSON файл з повними даними
-            with open(self.osd_json_path, 'w') as f:
-                json.dump(self.osd_data, f, indent=2)
-            
-            # Текстовий overlay для GStreamer textoverlay
-            overlay_text = self.generate_overlay_text()
-            with open(self.osd_overlay_path, 'w') as f:
-                f.write(overlay_text)
-                
-        except Exception as e:
-            logging.debug(f"OSD save error: {e}")
-    
-    def generate_overlay_text(self):
-        """Згенерувати текст для накладання на відео"""
-        # Перевірити свіжість даних (не старше 2 секунд)
-        data_age = time.time() - self.osd_data['timestamp']
-        if data_age > 2.0:
-            return "NO TELEMETRY"
-        
-        # Статус батареї
-        battery_status = f"🔋 {self.osd_data['voltage']:.1f}V ({self.osd_data['battery_percent']}%)"
-        if self.osd_data['voltage'] < 3.3:
-            battery_status = f"🔴 {battery_status}"  # Низький заряд
-        elif self.osd_data['voltage'] < 3.6:
-            battery_status = f"🟡 {battery_status}"  # Середній заряд
-        else:
-            battery_status = f"🟢 {battery_status}"  # Високий заряд
-        
-        # Статус зв'язку
-        lq_color = "🟢" if self.osd_data['link_quality'] > 80 else "🟡" if self.osd_data['link_quality'] > 50 else "🔴"
-        link_status = f"{lq_color} RSSI: {self.osd_data['rssi']}dBm LQ: {self.osd_data['link_quality']}%"
-        
-        # Статус польоту
-        armed_status = "🔴 ARMED" if self.osd_data['armed'] else "🟢 DISARMED"
-        flight_info = f"{armed_status} | Mode: {self.osd_data['flight_mode']}"
-        
-        # GPS та навігація
-        gps_info = ""
-        if 'altitude' in self.osd_data and self.osd_data['altitude'] != 0:
-            gps_info = f"Alt: {self.osd_data['altitude']:.1f}m | Spd: {self.osd_data['speed']:.1f}m/s"
-        
-        # Час
-        current_time = time.strftime("%H:%M:%S", time.localtime())
-        
-        # Компонувати OSD
-        lines = [
-            f"📡 RADXA FPV | {current_time}",
-            battery_status,
-            link_status,
-            flight_info
-        ]
-        
-        if gps_info:
-            lines.append(gps_info)
-        
-        return "\n".join(lines)
-    
-    def start_gstreamer(self):
-        """Запустити GStreamer для відображення RTSP з OSD"""
-        try:
-            # Створити початковий OSD файл
-            self.update_osd_files()
-            
-            # GStreamer pipeline для RTSP з текстовим накладанням
-            gst_pipeline = [
-                "gst-launch-1.0",
-                # RTSP джерело
-                "rtspsrc", f"location={self.rtsp_url}",
-                "latency=50", "buffer-mode=1", "!",
-                
-                # Декодування
-                "rtph264depay", "!",
-                "avdec_h264", "!",
-                
-                # Конвертація кольорів
-                "videoconvert", "!",
-                
-                # Текстове накладання з динамічним оновленням
-                "textoverlay",
-                f"text-file={self.osd_overlay_path}",
-                "font-desc=Monospace Bold 16",
-                "valignment=top",
-                "halignment=left",
-                "xpad=20",
-                "ypad=20",
-                "color=0xFFFFFFFF",  # Білий текст
-                "outline-color=0x000000FF",  # Чорний контур
-                "!",
-                
-                # Масштабування (опційно)
-                "videoscale", "!",
-                "video/x-raw,width=1280,height=720", "!",
-                
-                # Виведення на екран
-                "ximagesink",
-                f"display-name={self.display_output}",
-                "sync=false"
-            ]
-            
-            # Запустити GStreamer процес
-            env = os.environ.copy()
-            env['DISPLAY'] = self.display_output
-            
-            self.gstreamer_process = subprocess.Popen(
-                gst_pipeline,
-                env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                preexec_fn=os.setsid  # Для коректної зупинки
-            )
-            
-            logging.info(f"🎥 GStreamer started: {self.rtsp_url} → {self.display_output}")
-            logging.info(f"📺 OSD overlay: {self.osd_overlay_path}")
-            return True
-            
-        except Exception as e:
-            logging.error(f"❌ GStreamer start failed: {e}")
+
+    @staticmethod
+    def crc8_data(data) -> int:
+        crc = 0
+        for a in data:
+            crc = CRSFParser.crc8_dvb_s2(crc, a)
+        return crc
+
+    @staticmethod
+    def validate_frame(frame) -> bool:
+        if len(frame) < 4:
             return False
+        return CRSFParser.crc8_data(frame[2:-1]) == frame[-1]
+
+    @staticmethod
+    def signed_byte(b):
+        return b - 256 if b >= 128 else b
+
+    @staticmethod
+    def parse_packet(frame_data, telemetry: TelemetryData):
+        """Розпарсити пакет телеметрії"""
+        if len(frame_data) < 3:
+            return
+        
+        ptype = frame_data[2]
+        data = frame_data
+        current_time = time.time()
+        
+        try:
+            if ptype == PacketsTypes.LINK_STATISTICS and len(data) >= 10:
+                telemetry.rssi = CRSFParser.signed_byte(data[3])
+                telemetry.link_quality = data[5]
+                telemetry.snr = CRSFParser.signed_byte(data[6])
+                telemetry.link_last_update = current_time
+                
+            elif ptype == PacketsTypes.BATTERY_SENSOR and len(data) >= 11:
+                telemetry.voltage = int.from_bytes(data[3:5], byteorder='big', signed=True) / 10.0
+                telemetry.current = int.from_bytes(data[5:7], byteorder='big', signed=True) / 10.0
+                telemetry.battery_percent = data[10]
+                telemetry.battery_last_update = current_time
+                
+            elif ptype == PacketsTypes.GPS and len(data) >= 18:
+                telemetry.latitude = int.from_bytes(data[3:7], byteorder='big', signed=True) / 1e7
+                telemetry.longitude = int.from_bytes(data[7:11], byteorder='big', signed=True) / 1e7
+                telemetry.ground_speed = int.from_bytes(data[11:13], byteorder='big', signed=True) / 36.0
+                telemetry.altitude = int.from_bytes(data[15:17], byteorder='big', signed=True) - 1000
+                telemetry.satellites = data[17]
+                telemetry.gps_last_update = current_time
+                
+            elif ptype == PacketsTypes.ATTITUDE and len(data) >= 9:
+                telemetry.pitch = int.from_bytes(data[3:5], byteorder='big', signed=True) / 10000.0 * 57.29578
+                telemetry.roll = int.from_bytes(data[5:7], byteorder='big', signed=True) / 10000.0 * 57.29578
+                telemetry.yaw = int.from_bytes(data[7:9], byteorder='big', signed=True) / 10000.0 * 57.29578
+                
+            elif ptype == PacketsTypes.RC_CHANNELS_PACKED and len(data) >= 24:
+                bits = int.from_bytes(data[3:25], 'little')
+                for i in range(16):
+                    channel = (bits >> (i * 11)) & 0x7FF
+                    telemetry.channels[i] = channel
+                    
+            elif ptype == PacketsTypes.FLIGHT_MODE:
+                mode_str = data[3:].decode('utf-8', errors='ignore').rstrip('\x00')
+                telemetry.flight_mode = mode_str
+                
+            telemetry.last_update = current_time
+            
+        except Exception as e:
+            print(f"Parse error: {e}")
+
+class SimpleCRSFBridge:
+    """Простий CRSF bridge як у вашому коді"""
     
-    def stop_gstreamer(self):
-        """Зупинити GStreamer"""
-        if self.gstreamer_process:
+    def __init__(self, rx_port="/dev/ttyUSB1", fc_port="/dev/ttyUSB0", baud_rate=420000):
+        self.rx_port = rx_port      # RX приймач
+        self.fc_port = fc_port      # FC 
+        self.baud_rate = baud_rate
+        self.fallback_baud = 115200
+        
+        self.rx_serial = None
+        self.fc_serial = None
+        self.running = False
+        
+        self.stats = {'rx_packets': 0, 'fc_packets': 0, 'errors': 0}
+        
+    def connect(self):
+        """Підключитися з автоматичним fallback"""
+        for baud in [self.baud_rate, self.fallback_baud]:
             try:
-                # Спробувати м'яку зупинку
-                os.killpg(os.getpgid(self.gstreamer_process.pid), signal.SIGTERM)
+                print(f"🔌 Trying bridge at {baud} baud...")
                 
-                # Дочекатися завершення або примусово вбити
-                try:
-                    self.gstreamer_process.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    os.killpg(os.getpgid(self.gstreamer_process.pid), signal.SIGKILL)
-                    self.gstreamer_process.wait()
+                self.rx_serial = serial.Serial(self.rx_port, baud, timeout=0.01)
+                self.fc_serial = serial.Serial(self.fc_port, baud, timeout=0.01)
                 
-                logging.info("🎥 GStreamer stopped")
+                print(f"✅ Bridge connected at {baud} baud")
+                print(f"🌉 Bridge: {self.rx_port} → {self.fc_port}")
+                return True
                 
             except Exception as e:
-                logging.error(f"❌ GStreamer stop error: {e}")
-            
-            finally:
-                self.gstreamer_process = None
+                print(f"❌ Bridge failed at {baud}: {e}")
+                self.disconnect()
+        
+        return False
     
-    def gstreamer_monitor_thread(self):
-        """Потік моніторингу GStreamer"""
-        while self.running:
-            if self.gstreamer_process:
-                # Перевірити чи працює процес
-                if self.gstreamer_process.poll() is not None:
-                    logging.warning("⚠️ GStreamer process died, restarting...")
-                    self.stop_gstreamer()
-                    time.sleep(2)
-                    if self.running:
-                        self.start_gstreamer()
-            
-            time.sleep(5)
+    def disconnect(self):
+        """Відключити"""
+        if self.rx_serial:
+            self.rx_serial.close()
+            self.rx_serial = None
+        if self.fc_serial:
+            self.fc_serial.close()
+            self.fc_serial = None
     
-    def osd_update_thread(self):
-        """Потік оновлення OSD файлів"""
+    def bridge_loop(self, telemetry_data):
+        """Головний цикл bridge"""
+        print("🔄 Bridge thread started")
+        
         while self.running:
             try:
-                # Оновлювати OSD файли кожні 100мс навіть без нових даних
-                # для оновлення часу та перевірки свіжості
-                self.update_osd_files()
-                time.sleep(0.1)
+                # USB1 → USB0 (RX → FC) - передача команд управління
+                if self.rx_serial and self.rx_serial.in_waiting > 0:
+                    data = self.rx_serial.read(self.rx_serial.in_waiting)
+                    if self.fc_serial:
+                        self.fc_serial.write(data)
+                    self.stats['rx_packets'] += len(data)
+                
+                # USB0 → USB1 (FC → RX) - телеметрія назад
+                if self.fc_serial and self.fc_serial.in_waiting > 0:
+                    data = self.fc_serial.read(self.fc_serial.in_waiting)
+                    if self.rx_serial:
+                        self.rx_serial.write(data)
+                    self.stats['fc_packets'] += len(data)
+                
+                # Оновити статистику в телеметрії
+                telemetry_data.bridge_active = True
+                telemetry_data.rx_packets = self.stats['rx_packets']
+                telemetry_data.fc_packets = self.stats['fc_packets']
+                
+                time.sleep(0.001)  # 1ms
                 
             except Exception as e:
-                logging.error(f"❌ OSD update error: {e}")
-                time.sleep(1)
+                print(f"❌ Bridge error: {e}")
+                self.stats['errors'] += 1
+                telemetry_data.bridge_active = False
+                time.sleep(0.01)
     
-    def stats_thread(self):
-        """Потік статистики"""
-        while self.running:
-            time.sleep(5)
-            
-            if self.stats['start_time']:
-                uptime = time.time() - self.stats['start_time']
-                crsf_rate = self.stats['crsf_sent'] / uptime if uptime > 0 else 0
-                tel_rate = self.stats['telemetry_received'] / uptime if uptime > 0 else 0
-                
-                gst_status = "🎥 Running" if self.gstreamer_process and self.gstreamer_process.poll() is None else "❌ Stopped"
-                
-                logging.info(f"📊 CRSF→Camera: {self.stats['crsf_sent']} ({crsf_rate:.1f}/s) | "
-                           f"Telemetry←Camera: {self.stats['telemetry_received']} ({tel_rate:.1f}/s) | "
-                           f"Errors: {self.stats['errors']} | GStreamer: {gst_status} | Uptime: {uptime:.0f}s")
-    
-    def start(self):
-        """Запустити передавач"""
+    def start(self, telemetry_data):
+        """Запустити bridge"""
         if not self.connect():
             return False
         
         self.running = True
-        self.stats['start_time'] = time.time()
         
-        # Запустити GStreamer
-        if not self.start_gstreamer():
-            logging.warning("⚠️ Failed to start GStreamer, continuing without video display")
+        # Запустити bridge потік
+        self.bridge_thread = threading.Thread(
+            target=self.bridge_loop, 
+            args=(telemetry_data,), 
+            daemon=True
+        )
+        self.bridge_thread.start()
         
-        # Запустити потоки
-        self.rx_thread = threading.Thread(target=self.rx_to_udp_thread, daemon=True)
-        self.udp_thread = threading.Thread(target=self.udp_to_display_thread, daemon=True)
-        self.stats_th = threading.Thread(target=self.stats_thread, daemon=True)
-        self.gst_monitor_th = threading.Thread(target=self.gstreamer_monitor_thread, daemon=True)
-        self.osd_update_th = threading.Thread(target=self.osd_update_thread, daemon=True)
-        
-        self.rx_thread.start()
-        self.udp_thread.start()
-        self.stats_th.start()
-        self.gst_monitor_th.start()
-        self.osd_update_th.start()
-        
-        logging.info(f"🚀 RADXA UDP Transmitter with GStreamer OSD started")
-        logging.info(f"📡 Sending CRSF to {self.camera_ip}:{self.crsf_port}")
-        logging.info(f"📺 Receiving telemetry on port {self.telemetry_port}")
-        logging.info(f"🎥 Video stream: {self.rtsp_url}")
+        print("🚀 CRSF Bridge running!")
         return True
     
     def stop(self):
-        """Зупинити передавач"""
+        """Зупинити bridge"""
         self.running = False
-        time.sleep(0.5)
+        time.sleep(0.1)
         self.disconnect()
-        logging.info("⏹️ RADXA UDP Transmitter stopped")
+        print("⏹️ Bridge stopped")
+
+class HDMIOSDWithBridge:
+    """HDMI OSD з CRSF bridge"""
+    
+    def __init__(self, rtsp_input=None, fc_port="/dev/ttyUSB0", rx_port="/dev/ttyUSB1", 
+                 baud_rate=420000, resolution="1920x1080", framerate=30, fullscreen=True, 
+                 enable_bridge=True):
+        self.rtsp_input = rtsp_input
+        self.fc_port = fc_port
+        self.rx_port = rx_port
+        self.baud_rate = baud_rate
+        self.resolution = resolution
+        self.framerate = framerate
+        self.fullscreen = fullscreen
+        self.enable_bridge = enable_bridge
+        
+        self.pipeline = None
+        self.loop = None
+        self.fc_serial = None  # Тільки для читання телеметрії
+        self.running = False
+        
+        # Дані
+        self.telemetry = TelemetryData()
+        self.serial_buffer = bytearray()
+        
+        # GStreamer елементи
+        self.text_overlays = {}
+        
+        # Розпарсити роздільність
+        self.width, self.height = map(int, resolution.split('x'))
+        
+        # Bridge
+        if self.enable_bridge:
+            self.bridge = SimpleCRSFBridge(self.rx_port, self.fc_port, self.baud_rate)
+        else:
+            self.bridge = None
+    
+    def connect_telemetry(self):
+        """Підключитися до FC для читання телеметрії"""
+        try:
+            self.fc_serial = serial.Serial(
+                self.fc_port, self.baud_rate,
+                timeout=0.01, bytesize=8, parity='N', stopbits=1
+            )
+            print(f"✅ Telemetry connected: {self.fc_port} @ {self.baud_rate}")
+            return True
+        except Exception as e:
+            print(f"❌ Telemetry connection failed: {e}")
+            return False
+    
+    def create_gstreamer_pipeline(self):
+        """Створити GStreamer pipeline"""
+        # Вибрати джерело відео з обробкою зависань
+        if self.rtsp_input:
+            video_source = f"""
+            rtspsrc location={self.rtsp_input} 
+                latency=0 
+                drop-on-latency=true 
+                do-retransmission=false 
+                timeout=5000000
+                tcp-timeout=5000000
+                retry=3
+                protocols=tcp+udp-mcast+udp ! 
+            queue max-size-buffers=3 leaky=downstream ! 
+            rtph264depay ! 
+            queue max-size-buffers=3 leaky=downstream ! 
+            avdec_h264 max-threads=2 skip-frame=1 ! 
+            queue max-size-buffers=2 leaky=downstream ! 
+            videoscale ! 
+            video/x-raw,width={self.width},height={self.height} !
+            videoconvert !
+            """
+        else:
+            video_source = f"""
+            videotestsrc pattern=ball is-live=true ! 
+            video/x-raw,width={self.width},height={self.height},framerate={self.framerate}/1 ! 
+            videoconvert !
+            """
+        
+        # Pipeline БЕЗ OSD - тільки чистий відеопотік
+        pipeline_str = video_source
+        
+        # Додати буфер перед виходом
+        pipeline_str += "queue max-size-buffers=2 leaky=downstream !"
+        
+        # Вихід через KMS для мінімальної затримки
+        if self.fullscreen:
+            pipeline_str += f"""
+            videoconvert ! 
+            videoscale method=nearest-neighbour ! 
+            video/x-raw,width={self.width},height={self.height} !
+            kmssink sync=false max-lateness=0 qos=false processing-deadline=0 render-delay=0 async=false
+            """
+        else:
+            # Fallback для віконного режиму
+            pipeline_str += f"""
+            videoconvert ! 
+            videoscale method=nearest-neighbour ! 
+            video/x-raw,width={self.width},height={self.height} !
+            ximagesink sync=false force-aspect-ratio=true qos=false async=false
+            """
+        
+        return pipeline_str
+    
+    def setup_pipeline(self):
+        """Налаштувати GStreamer pipeline"""
+        pipeline_str = self.create_gstreamer_pipeline()
+        
+        print(f"🎬 Creating clean video pipeline (no OSD)...")
+        print(f"Pipeline: {pipeline_str[:100]}...")
+        
+        self.pipeline = Gst.parse_launch(pipeline_str)
+        if not self.pipeline:
+            print("❌ Failed to create pipeline")
+            return False
+        
+        # Без OSD елементів - тільки відео
+        self.text_overlays = {}
+        
+        # Message handler
+        bus = self.pipeline.get_bus()
+        bus.add_signal_watch()
+        bus.connect('message', self.on_message)
+        
+        # Додати watchdog для відновлення
+        if self.rtsp_input:
+            GLib.timeout_add_seconds(10, self.check_pipeline_health)
+        
+        return True
+    
+    def check_pipeline_health(self):
+        """Перевірити здоров'я pipeline і перезапустити при зависанні"""
+        try:
+            # Отримати статистику з rtspsrc
+            rtspsrc = self.pipeline.get_by_name("rtspsrc0")
+            if rtspsrc:
+                # Перевірити чи течуть дані
+                pass
+            
+            # Продовжити моніторинг
+            return True if self.running else False
+            
+        except Exception as e:
+            print(f"⚠️ Pipeline health check failed: {e}")
+            return True if self.running else False
+    
+    def restart_pipeline(self):
+        """Перезапустити pipeline при проблемах"""
+        try:
+            print("🔄 Restarting pipeline...")
+            self.pipeline.set_state(Gst.State.NULL)
+            time.sleep(1)
+            ret = self.pipeline.set_state(Gst.State.PLAYING)
+            if ret == Gst.StateChangeReturn.FAILURE:
+                print("❌ Failed to restart pipeline")
+            else:
+                print("✅ Pipeline restarted")
+        except Exception as e:
+            print(f"❌ Restart failed: {e}")
+    
+    def on_message(self, bus, message):
+        """Обробник повідомлень GStreamer"""
+        if message.type == Gst.MessageType.ERROR:
+            err, debug = message.parse_error()
+            print(f"❌ GStreamer Error: {err}")
+            print(f"Debug: {debug}")
+            
+            # Спробувати перезапустити при помилці RTSP
+            if "rtsp" in str(err).lower() or "network" in str(err).lower():
+                print("🔄 Network error detected, attempting restart...")
+                threading.Thread(target=self.restart_pipeline, daemon=True).start()
+            else:
+                self.loop.quit()
+                
+        elif message.type == Gst.MessageType.EOS:
+            print("📺 End of stream")
+            self.loop.quit()
+            
+        elif message.type == Gst.MessageType.WARNING:
+            warn, debug = message.parse_warning()
+            print(f"⚠️ GStreamer Warning: {warn}")
+            
+        elif message.type == Gst.MessageType.STATE_CHANGED:
+            if message.src == self.pipeline:
+                old_state, new_state, pending = message.parse_state_changed()
+                print(f"🎬 Pipeline state: {old_state.value_nick} → {new_state.value_nick}")
+                
+        elif message.type == Gst.MessageType.BUFFERING:
+            percent = message.parse_buffering()
+            print(f"📊 Buffering: {percent}%")
+            if percent < 100:
+                self.pipeline.set_state(Gst.State.PAUSED)
+            else:
+                self.pipeline.set_state(Gst.State.PLAYING)
+    
+    def draw_crosshair(self, overlay, cr, timestamp, duration, user_data):
+        """Намалювати crosshair і штучний горизонт"""
+        center_x = self.width / 2
+        center_y = self.height / 2
+        crosshair_size = int(self.width * 0.02)
+        
+        # Crosshair
+        cr.set_source_rgba(0, 1, 0, 0.8)
+        cr.set_line_width(3)
+        
+        cr.move_to(center_x - crosshair_size, center_y)
+        cr.line_to(center_x + crosshair_size, center_y)
+        cr.stroke()
+        
+        cr.move_to(center_x, center_y - crosshair_size)
+        cr.line_to(center_x, center_y + crosshair_size)
+        cr.stroke()
+        
+        cr.arc(center_x, center_y, 4, 0, 2 * math.pi)
+        cr.fill()
+        
+        # Штучний горизонт
+        if abs(self.telemetry.roll) > 1 or abs(self.telemetry.pitch) > 1:
+            horizon_y = center_y + self.telemetry.pitch * 3
+            roll_rad = self.telemetry.roll * math.pi / 180
+            
+            horizon_len = self.width * 0.1
+            cos_roll = math.cos(roll_rad)
+            sin_roll = math.sin(roll_rad)
+            
+            x1 = center_x - horizon_len * cos_roll
+            y1 = horizon_y + horizon_len * sin_roll
+            x2 = center_x + horizon_len * cos_roll
+            y2 = horizon_y - horizon_len * sin_roll
+            
+            cr.set_source_rgba(0, 1, 0, 1)
+            cr.set_line_width(4)
+            cr.move_to(x1, y1)
+            cr.line_to(x2, y2)
+            cr.stroke()
+    
+    def update_osd_text(self):
+        """Оновити OSD текст"""
+        current_time = time.time()
+        
+        # RSSI & Link Quality
+        if current_time - self.telemetry.link_last_update < 5:
+            rssi_color = 0xFF00FF00 if self.telemetry.rssi > -70 else 0xFFFF0000
+            rssi_text = f"RSSI: {self.telemetry.rssi}dBm\\nLQ: {self.telemetry.link_quality:03d}"
+        else:
+            rssi_color = 0xFFFF0000
+            rssi_text = "RSSI: NO LINK\\nLQ: ---"
+        
+        if 'rssi_overlay' in self.text_overlays:
+            self.text_overlays['rssi_overlay'].set_property('text', rssi_text)
+            self.text_overlays['rssi_overlay'].set_property('color', rssi_color)
+        
+        # Battery
+        if current_time - self.telemetry.battery_last_update < 10:
+            batt_color = 0xFF00FF00 if self.telemetry.voltage > 14.0 else 0xFFFF0000
+            batt_text = f"BATT: {self.telemetry.voltage:.1f}V"
+            if self.telemetry.battery_percent > 0:
+                batt_text += f"\\n{self.telemetry.battery_percent}%"
+            else:
+                batt_text += "\\n--%"
+        else:
+            batt_color = 0xFFFF0000
+            batt_text = "BATT: NO DATA\\n--%"
+        
+        if 'battery_overlay' in self.text_overlays:
+            self.text_overlays['battery_overlay'].set_property('text', batt_text)
+            self.text_overlays['battery_overlay'].set_property('color', batt_color)
+        
+        # GPS
+        if current_time - self.telemetry.gps_last_update < 10 and self.telemetry.satellites > 0:
+            gps_color = 0xFF00FF00 if self.telemetry.satellites >= 6 else 0xFFFFFF00
+            gps_text = f"GPS: {self.telemetry.satellites} SATs\\nALT: {self.telemetry.altitude:.0f}m"
+        else:
+            gps_color = 0xFFFF0000
+            gps_text = "GPS: NO FIX\\nALT: ---m"
+        
+        if 'gps_overlay' in self.text_overlays:
+            self.text_overlays['gps_overlay'].set_property('text', gps_text)
+            self.text_overlays['gps_overlay'].set_property('color', gps_color)
+        
+        # Attitude
+        attitude_text = f"PITCH: {self.telemetry.pitch:.1f}°\\nROLL: {self.telemetry.roll:.1f}°\\nYAW: {self.telemetry.yaw:.1f}°"
+        if 'attitude_overlay' in self.text_overlays:
+            self.text_overlays['attitude_overlay'].set_property('text', attitude_text)
+        
+        # Flight Mode
+        mode_text = f"MODE: {self.telemetry.flight_mode}"
+        if 'mode_overlay' in self.text_overlays:
+            self.text_overlays['mode_overlay'].set_property('text', mode_text)
+        
+        # Bridge Status
+        if self.enable_bridge:
+            bridge_color = 0xFF00FF00 if self.telemetry.bridge_active else 0xFFFF0000
+            bridge_text = f"BRIDGE: {'ACTIVE' if self.telemetry.bridge_active else 'INACTIVE'}\\nRX→FC: {self.telemetry.rx_packets} | FC→RX: {self.telemetry.fc_packets}"
+        else:
+            bridge_color = 0xFFFFFF00
+            bridge_text = "BRIDGE: DISABLED"
+        
+        if 'bridge_overlay' in self.text_overlays:
+            self.text_overlays['bridge_overlay'].set_property('text', bridge_text)
+            self.text_overlays['bridge_overlay'].set_property('color', bridge_color)
+        
+        # RC Channels
+        rc_text = f"CH1-4: {self.telemetry.channels[0]} {self.telemetry.channels[1]} {self.telemetry.channels[2]} {self.telemetry.channels[3]}"
+        if 'rc_overlay' in self.text_overlays:
+            self.text_overlays['rc_overlay'].set_property('text', rc_text)
+    
+    def read_telemetry(self):
+        """Читати телеметрію з FC"""
+        while self.running:
+            try:
+                if self.fc_serial and self.fc_serial.in_waiting > 0:
+                    data = self.fc_serial.read(self.fc_serial.in_waiting)
+                    self.serial_buffer.extend(data)
+                    
+                    while len(self.serial_buffer) > 2:
+                        if self.serial_buffer[0] != CRSF_SYNC:
+                            self.serial_buffer.pop(0)
+                            continue
+                            
+                        expected_len = self.serial_buffer[1] + 2
+                        if expected_len > 64 or expected_len < 4:
+                            self.serial_buffer.pop(0)
+                            continue
+                            
+                        if len(self.serial_buffer) < expected_len:
+                            break
+                            
+                        frame = bytes(self.serial_buffer[:expected_len])
+                        self.serial_buffer[:expected_len] = []
+                        
+                        if CRSFParser.validate_frame(frame):
+                            CRSFParser.parse_packet(frame, self.telemetry)
+                
+                time.sleep(0.001)
+                
+            except Exception as e:
+                print(f"Telemetry read error: {e}")
+                time.sleep(0.01)
+    
+    def update_osd_loop(self):
+        """Оновити OSD"""
+        while self.running:
+            self.update_osd_text()
+            time.sleep(0.1)  # 10 FPS
+    
+    def print_status(self):
+        """Статус системи"""
+        while self.running:
+            
+            # Bridge статус
+            if self.enable_bridge:
+                bridge_status = "🌉 ACTIVE" if self.telemetry.bridge_active else "🌉 INACTIVE"
+                bridge_stats = f"RX→FC: {self.telemetry.rx_packets} | FC→RX: {self.telemetry.fc_packets}"
+            else:
+                bridge_status = "🌉 DISABLED"
+                bridge_stats = ""
+            
+            print(f"\r📺 Clean Video | {bridge_status} | {bridge_stats}    ", 
+                  end="", flush=True)
+            
+            time.sleep(2)
+    
+    def run(self):
+        """Запустити систему"""
+        # Перевірити порти
+        if self.enable_bridge:
+            if not os.path.exists(self.rx_port):
+                print(f"❌ RX port {self.rx_port} not found!")
+                return False
+            if not os.path.exists(self.fc_port):
+                print(f"❌ FC port {self.fc_port} not found!")
+                return False
+        
+        # Підключити телеметрію
+        if not self.connect_telemetry():
+            print("⚠️ Continuing without telemetry")
+        
+        # Налаштувати pipeline
+        if not self.setup_pipeline():
+            return False
+        
+        self.running = True
+        
+        # Запустити bridge
+        if self.enable_bridge and self.bridge:
+            if not self.bridge.start(self.telemetry):
+                print("❌ Failed to start bridge")
+                return False
+        
+        # Запустити потоки
+        threads = []
+        
+        # Телеметрія
+        if self.fc_serial:
+            telemetry_thread = threading.Thread(target=self.read_telemetry, daemon=True)
+            telemetry_thread.start()
+            threads.append(telemetry_thread)
+        
+        # OSD
+        osd_thread = threading.Thread(target=self.update_osd_loop, daemon=True)
+        osd_thread.start()
+        threads.append(osd_thread)
+        
+        # Статус
+        status_thread = threading.Thread(target=self.print_status, daemon=True)
+        status_thread.start()
+        threads.append(status_thread)
+        
+        # Запустити pipeline
+        ret = self.pipeline.set_state(Gst.State.PLAYING)
+        if ret == Gst.StateChangeReturn.FAILURE:
+            print("❌ Failed to start pipeline")
+            return False
+        
+        # Головний loop
+        self.loop = GLib.MainLoop()
+        
+        print("🎬 CRSF HDMI OSD with Bridge running!")
+        print("🎬 CRSF HDMI OSD with Bridge running!")
+        print(f"📺 Video: {self.rtsp_input or 'Test Pattern'} -> HDMI {self.resolution}")
+        print(f"📡 Telemetry: {self.fc_port} @ {self.baud_rate}")
+        
+        if self.enable_bridge:
+            print(f"🌉 Bridge: {self.rx_port} → {self.fc_port}")
+            print("   Control commands: RX → FC")
+            print("   Telemetry back: FC → RX")
+        else:
+            print("🌉 Bridge: DISABLED (OSD only)")
+        
+        print("Press Ctrl+C to stop\n")
+        
+        try:
+            self.loop.run()
+        except KeyboardInterrupt:
+            print("\n🛑 Stopping system...")
+        finally:
+            self.running = False
+            if self.bridge and self.enable_bridge:
+                self.bridge.stop()
+            if self.pipeline:
+                self.pipeline.set_state(Gst.State.NULL)
+            if self.fc_serial:
+                self.fc_serial.close()
+        
+        return True
 
 def main():
-    print("📡 RADXA UDP TRANSMITTER + GSTREAMER OSD")
+    parser = argparse.ArgumentParser(description='Clean Video + CRSF Bridge Control')
+    parser.add_argument('-i', '--input', help='RTSP input URL')
+    parser.add_argument('--fc-port', default='/dev/ttyUSB0', help='FC port (for bridge)')
+    parser.add_argument('--rx-port', default='/dev/ttyUSB1', help='RX port (for control input)')
+    parser.add_argument('-b', '--baud', type=int, default=420000, help='CRSF baud rate')
+    parser.add_argument('-r', '--resolution', default='1920x1080', 
+                       choices=['1280x720', '1920x1080', '3840x2160', '2560x1440', '640x480', '848x480'],
+                       help='Output resolution')
+    parser.add_argument('-f', '--framerate', type=int, default=30, help='Frame rate')
+    parser.add_argument('-w', '--windowed', action='store_true', help='Windowed mode (uses ximagesink)')
+    parser.add_argument('--no-bridge', action='store_true', help='Disable bridge (video only)')
+    
+    args = parser.parse_args()
+    
+    # Визначити режим
+    enable_bridge = not args.no_bridge
+    
+    print("🎬 CLEAN VIDEO + CRSF BRIDGE CONTROL")
     print("=" * 50)
-    print("Sends CRSF packets to IP camera via UDP")
-    print("Receives telemetry for OSD overlay")
-    print("Displays RTSP stream with telemetry overlay")
+    print(f"Video Input: {args.input or 'Test Pattern'}")
+    if enable_bridge:
+        print(f"RX Port: {args.rx_port} (control input)")
+        print(f"FC Port: {args.fc_port} (bridge output)")
+        print(f"Bridge: {args.rx_port} → {args.fc_port}")
+    else:
+        print("Bridge: DISABLED")
+    print(f"Baud Rate: {args.baud}")
+    print(f"Output: {'KMS' if not args.windowed else 'X11'} {args.resolution} @ {args.framerate}fps")
+    print(f"Mode: Clean video passthrough (NO OSD, NO telemetry parsing)")
     print()
     
-    # Конфігурація
-    rx_port = input("RX port [/dev/ttyUSB1]: ").strip() or "/dev/ttyUSB1"
-    camera_ip = input("Camera IP [192.168.1.100]: ").strip() or "192.168.1.100"
-    crsf_port = int(input("CRSF UDP port [5000]: ").strip() or "5000")
-    telemetry_port = int(input("Telemetry UDP port [5001]: ").strip() or "5001")
-    baud = int(input("UART baud [420000]: ").strip() or "420000")
+    if enable_bridge:
+        print("🌉 BRIDGE MODE ENABLED")
+        print("This will pass control commands from RX to FC:")
+        print(f"  • RX input: {args.rx_port}")
+        print(f"  • FC output: {args.fc_port}")
+        print("  • Transparent passthrough like your original bridge")
+        print("  • No OSD overlay on video")
+        print("  • No telemetry parsing (performance optimized)")
+        print()
+        
+        if not os.path.exists(args.rx_port):
+            print(f"❌ RX port {args.rx_port} not found!")
+            print("Connect your RX device or use --no-bridge")
+            return
+            
+        if not os.path.exists(args.fc_port):
+            print(f"❌ FC port {args.fc_port} not found!")
+            print("Connect your FC device or use --no-bridge")
+            return
+        
+        response = input("Continue with bridge enabled? (y/n): ")
+        if response.lower() != 'y':
+            print("Bridge disabled")
+            enable_bridge = False
     
-    # RTSP конфігурація
-    default_rtsp = f"rtsp://root:12345@192.168.0.100:554/stream1"
-    rtsp_url = input(f"RTSP URL [{default_rtsp}]: ").strip() or default_rtsp
-    display_output = input("Display output [:0.0]: ").strip() or ":0.0"
-    
-    print(f"\n🔧 Configuration:")
-    print(f"  RX Port: {rx_port}")
-    print(f"  Camera IP: {camera_ip}")
-    print(f"  CRSF UDP Port: {crsf_port}")
-    print(f"  Telemetry UDP Port: {telemetry_port}")
-    print(f"  UART Baud: {baud}")
-    print(f"  RTSP URL: {rtsp_url}")
-    print(f"  Display: {display_output}")
+    print("Features:")
+    print("  📺 Clean video passthrough")
+    print("  ⚡ Zero-latency KMS output")
+    print("  🔄 Auto-recovery on video freeze")
+    if enable_bridge:
+        print("  🌉 USB1→USB0 bridge (like your original script)")
+        print("  📈 Bridge statistics in console")
+    print("  🚫 NO OSD overlay")
+    print("  🚫 NO telemetry parsing")
     print()
     
-    # Перевірити наявність GStreamer
-    try:
-        subprocess.run(["gst-launch-1.0", "--version"], 
-                      capture_output=True, check=True)
-        print("✅ GStreamer detected")
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        print("❌ GStreamer not found! Install with:")
-        print("   sudo apt-get install gstreamer1.0-tools gstreamer1.0-plugins-*")
-        print("   Continuing anyway...")
-    
-    # Створити передавач
-    transmitter = RadxaUDPTransmitter(
-        rx_port, camera_ip, crsf_port, telemetry_port, baud, 
-        rtsp_url, display_output
+    # Запустити систему
+    system = HDMIOSDWithBridge(
+        rtsp_input=args.input,
+        fc_port=args.fc_port,
+        rx_port=args.rx_port,
+        baud_rate=args.baud,
+        resolution=args.resolution,
+        framerate=args.framerate,
+        fullscreen=not args.windowed,
+        enable_bridge=enable_bridge
     )
     
-    try:
-        if transmitter.start():
-            print("✅ Transmitter + GStreamer running! Press Ctrl+C to stop")
-            print("📊 Check radxa_transmitter.log for detailed logs")
-            print(f"📺 OSD data: {transmitter.osd_json_path}")
-            print(f"🎥 Video overlay: {transmitter.osd_overlay_path}")
-            print()
-            print("OSD Elements:")
-            print("  🔋 Battery voltage and percentage")
-            print("  📡 RSSI and Link Quality")
-            print("  ✈️ Flight mode and armed status")
-            print("  🗺️ Altitude and speed (if available)")
-            print("  🕐 Current time")
-            
-            while True:
-                time.sleep(1)
-        else:
-            print("❌ Failed to start transmitter")
+    system.run()
+
+if __name__ == "__main__":
+    main().resolution,
+        framerate=args.framerate,
+        fullscreen=not args.windowed,
+        enable_bridge=enable_bridge
+    )
     
-    except KeyboardInterrupt:
-        print("\n🛑 Stopping transmitter and GStreamer...")
-        transmitter.stop()
-        print("✅ Everything stopped")
-    except Exception as e:
-        print(f"❌ Error: {e}")
-        transmitter.stop()
+    system.run().resolution,
+        framerate=args.framerate,
+        fullscreen=not args.windowed,
+        enable_bridge=enable_bridge
+    )
+    
+    system.run()
 
 if __name__ == "__main__":
     main()
