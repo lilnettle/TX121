@@ -190,6 +190,7 @@ public:
     int get_baud() const { return CRSF_BAUD; }
 };
 
+
 // Простий відеоплеєр
 class SimpleVideoPlayer {
 private:
