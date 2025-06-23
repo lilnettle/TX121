@@ -10,6 +10,9 @@
 #include <sys/stat.h>
 #include <sys/ioctl.h>
 #include <linux/serial.h>
+#include <termios.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 // Boost.Asio
 #include <boost/asio.hpp>
@@ -29,16 +32,325 @@ const std::string RX_PORT = "/dev/ttyUSB1";   // RX приймач
 const std::string FC_PORT = "/dev/ttyUSB0";   // FC
 const int CRSF_BAUD = 420000;  // Кастомна швидкість CRSF
 
-// Асинхронний CRSF Bridge з Boost.Asio
+// Структура для детальної конфігурації порту
+struct SerialConfig {
+    int baud_rate = 420000;
+    int data_bits = 8;
+    int stop_bits = 1;
+    char parity = 'N';  // 'N', 'E', 'O'
+    bool flow_control = false;
+    bool xonxoff = false;
+    bool rtscts = false;
+    bool dsrdtr = false;
+    
+    // Timeout налаштування (як у PySerial)
+    double timeout = 0.1;      // read timeout в секундах
+    double write_timeout = 0.1; // write timeout в секундах
+    
+    // Буферні налаштування
+    int read_buffer_size = 4096;
+    int write_buffer_size = 4096;
+    
+    // Додаткові налаштування
+    bool exclusive = true;      // ексклюзивний доступ
+    bool low_latency = true;    // мінімальна затримка
+};
+
+// Клас для роботи з серійними портами в стилі PySerial
+class PySerialLikePort {
+private:
+    int fd = -1;
+    std::string port_name;
+    SerialConfig config;
+    bool is_connected = false;
+    
+    // Налаштування termios структури
+    bool configure_termios() {
+        struct termios tty;
+        
+        if (tcgetattr(fd, &tty) < 0) {
+            std::cerr << "❌ Помилка tcgetattr для " << port_name << std::endl;
+            return false;
+        }
+        
+        // Очищення всіх попередніх налаштувань
+        memset(&tty, 0, sizeof(tty));
+        
+        // === НАЛАШТУВАННЯ ВВОДУ (cflag) ===
+        tty.c_cflag |= CREAD | CLOCAL;  // Увімкнути читання та ігнорувати modem control lines
+        
+        // Розмір символу
+        tty.c_cflag &= ~CSIZE;
+        switch (config.data_bits) {
+            case 5: tty.c_cflag |= CS5; break;
+            case 6: tty.c_cflag |= CS6; break;
+            case 7: tty.c_cflag |= CS7; break;
+            case 8: tty.c_cflag |= CS8; break;
+            default: tty.c_cflag |= CS8; break;
+        }
+        
+        // Парність
+        switch (config.parity) {
+            case 'E': case 'e':
+                tty.c_cflag |= PARENB;
+                tty.c_cflag &= ~PARODD;
+                break;
+            case 'O': case 'o':
+                tty.c_cflag |= PARENB;
+                tty.c_cflag |= PARODD;
+                break;
+            case 'N': case 'n':
+            default:
+                tty.c_cflag &= ~PARENB;
+                break;
+        }
+        
+        // Stop bits
+        if (config.stop_bits == 2) {
+            tty.c_cflag |= CSTOPB;
+        } else {
+            tty.c_cflag &= ~CSTOPB;
+        }
+        
+        // Flow control
+        if (config.rtscts) {
+            tty.c_cflag |= CRTSCTS;
+        } else {
+            tty.c_cflag &= ~CRTSCTS;
+        }
+        
+        // === НАЛАШТУВАННЯ ВВОДУ (iflag) ===
+        tty.c_iflag = 0;  // Сирий ввід
+        
+        if (config.xonxoff) {
+            tty.c_iflag |= IXON | IXOFF;
+        } else {
+            tty.c_iflag &= ~(IXON | IXOFF | IXANY);
+        }
+        
+        // Вимкнути обробку символів
+        tty.c_iflag &= ~(IGNBRK | BRKINT | PARMRK | ISTRIP | INLCR | IGNCR | ICRNL);
+        
+        // === НАЛАШТУВАННЯ ВИВОДУ (oflag) ===
+        tty.c_oflag = 0;  // Сирий вивід
+        
+        // === НАЛАШТУВАННЯ LOCAL (lflag) ===
+        tty.c_lflag = 0;  // Вимкнути канонічний режим та echo
+        
+        // === НАЛАШТУВАННЯ TIMEOUT ===
+        // VMIN та VTIME для неблокуючого читання
+        tty.c_cc[VMIN] = 0;   // Мінімум символів для читання
+        tty.c_cc[VTIME] = (cc_t)(config.timeout * 10);  // Timeout в десятих секунди
+        
+        // Застосування налаштувань
+        if (tcsetattr(fd, TCSANOW, &tty) < 0) {
+            std::cerr << "❌ Помилка tcsetattr для " << port_name << std::endl;
+            return false;
+        }
+        
+        return true;
+    }
+    
+    // Налаштування кастомної швидкості
+    bool set_custom_baud_rate(int baud) {
+        struct serial_struct ss;
+        
+        if (ioctl(fd, TIOCGSERIAL, &ss) < 0) {
+            std::cerr << "❌ Помилка отримання serial_struct для " << port_name << std::endl;
+            return false;
+        }
+        
+        // Налаштування кастомної швидкості
+        ss.flags = (ss.flags & ~ASYNC_SPD_MASK) | ASYNC_SPD_CUST;
+        ss.custom_divisor = ss.baud_base / baud;
+        
+        if (ioctl(fd, TIOCSSERIAL, &ss) < 0) {
+            std::cerr << "❌ Помилка встановлення кастомної швидкості " << baud 
+                      << " для " << port_name << std::endl;
+            return false;
+        }
+        
+        // Верифікація
+        if (ioctl(fd, TIOCGSERIAL, &ss) < 0) {
+            return false;
+        }
+        
+        int actual_baud = ss.baud_base / ss.custom_divisor;
+        std::cout << "✅ " << port_name << ": встановлено " << actual_baud 
+                  << " baud (запитано " << baud << ")" << std::endl;
+        
+        return true;
+    }
+    
+    // Налаштування розмірів буферів
+    bool configure_buffers() {
+        // Налаштування розмірів буферів ядра
+        if (ioctl(fd, TIOCOUTQ) >= 0) {  // Перевірка підтримки
+            // Спроба налаштувати буфери (не всі драйвери підтримують)
+            struct serial_struct ss;
+            if (ioctl(fd, TIOCGSERIAL, &ss) == 0) {
+                // Деякі драйвери дозволяють налаштовувати розміри буферів
+                std::cout << "📊 " << port_name << ": baud_base=" << ss.baud_base 
+                          << ", custom_divisor=" << ss.custom_divisor << std::endl;
+            }
+        }
+        
+        return true;
+    }
+    
+    // Налаштування низької затримки
+    bool configure_low_latency() {
+        if (!config.low_latency) return true;
+        
+        struct serial_struct ss;
+        if (ioctl(fd, TIOCGSERIAL, &ss) < 0) {
+            return false;
+        }
+        
+        ss.flags |= ASYNC_LOW_LATENCY;
+        
+        if (ioctl(fd, TIOCSSERIAL, &ss) < 0) {
+            std::cout << "⚠️ " << port_name << ": не вдалося встановити LOW_LATENCY" << std::endl;
+            return false;
+        }
+        
+        std::cout << "⚡ " << port_name << ": увімкнено LOW_LATENCY режим" << std::endl;
+        return true;
+    }
+
+public:
+    PySerialLikePort(const std::string& port, const SerialConfig& cfg = SerialConfig()) 
+        : port_name(port), config(cfg) {}
+    
+    ~PySerialLikePort() {
+        close();
+    }
+    
+    // Підключення до порту
+    bool open() {
+        if (is_connected) {
+            std::cout << "⚠️ " << port_name << " вже підключений" << std::endl;
+            return true;
+        }
+        
+        std::cout << "🔌 Підключення до " << port_name << "..." << std::endl;
+        
+        // Відкриття порту
+        int flags = O_RDWR | O_NOCTTY;
+        if (!config.exclusive) {
+            flags |= O_NONBLOCK;
+        }
+        
+        fd = ::open(port_name.c_str(), flags);
+        if (fd < 0) {
+            std::cerr << "❌ Не вдалося відкрити " << port_name 
+                      << ": " << strerror(errno) << std::endl;
+            return false;
+        }
+        
+        // Ексклюзивний доступ
+        if (config.exclusive) {
+            if (ioctl(fd, TIOCEXCL) < 0) {
+                std::cout << "⚠️ " << port_name << ": не вдалося встановити ексклюзивний доступ" << std::endl;
+            }
+        }
+        
+        // Налаштування порту
+        if (!configure_termios()) {
+            ::close(fd);
+            fd = -1;
+            return false;
+        }
+        
+        // Налаштування кастомної швидкості
+        if (!set_custom_baud_rate(config.baud_rate)) {
+            ::close(fd);
+            fd = -1;
+            return false;
+        }
+        
+        // Додаткові налаштування
+        configure_buffers();
+        configure_low_latency();
+        
+        // Очищення буферів
+        tcflush(fd, TCIOFLUSH);
+        
+        is_connected = true;
+        std::cout << "✅ " << port_name << " підключено успішно" << std::endl;
+        
+        return true;
+    }
+    
+    // Закриття порту
+    void close() {
+        if (is_connected && fd >= 0) {
+            tcflush(fd, TCIOFLUSH);
+            ::close(fd);
+            fd = -1;
+            is_connected = false;
+            std::cout << "🔌 " << port_name << " закрито" << std::endl;
+        }
+    }
+    
+    // Отримання file descriptor для Boost.Asio
+    int get_fd() const { return fd; }
+    bool connected() const { return is_connected; }
+    const std::string& get_port_name() const { return port_name; }
+    
+    // Прямий запис/читання (для тестування)
+    ssize_t write_direct(const void* data, size_t size) {
+        if (!is_connected) return -1;
+        return ::write(fd, data, size);
+    }
+    
+    ssize_t read_direct(void* data, size_t size) {
+        if (!is_connected) return -1;
+        return ::read(fd, data, size);
+    }
+    
+    // Очищення буферів
+    void flush() {
+        if (is_connected) {
+            tcflush(fd, TCIOFLUSH);
+        }
+    }
+    
+    // Отримання статистики порту
+    void print_port_info() {
+        if (!is_connected) return;
+        
+        struct serial_struct ss;
+        if (ioctl(fd, TIOCGSERIAL, &ss) == 0) {
+            std::cout << "📊 " << port_name << " інформація:" << std::endl;
+            std::cout << "   Baud base: " << ss.baud_base << std::endl;
+            std::cout << "   Custom divisor: " << ss.custom_divisor << std::endl;
+            std::cout << "   Actual baud: " << (ss.custom_divisor > 0 ? ss.baud_base / ss.custom_divisor : 0) << std::endl;
+            std::cout << "   Flags: 0x" << std::hex << ss.flags << std::dec << std::endl;
+        }
+        
+        // Статистика буферів
+        int input_queue = 0, output_queue = 0;
+        if (ioctl(fd, TIOCINQ, &input_queue) == 0) {
+            std::cout << "   Input queue: " << input_queue << " bytes" << std::endl;
+        }
+        if (ioctl(fd, TIOCOUTQ, &output_queue) == 0) {
+            std::cout << "   Output queue: " << output_queue << " bytes" << std::endl;
+        }
+    }
+};
+
+// Асинхронний CRSF Bridge з покращеними портами
 class AsyncCrsfBridge {
 private:
     io_context io_ctx;
-    serial_port rx_port, fc_port;
+    std::unique_ptr<serial_port> rx_port, fc_port;
+    std::unique_ptr<PySerialLikePort> rx_native, fc_native;
     deadline_timer stats_timer;
     std::thread io_thread;
     
     // Буфери для асинхронного читання
-    static constexpr size_t BUFFER_SIZE = 1024;
+    static constexpr size_t BUFFER_SIZE = 4096;  // Збільшений буфер
     std::vector<uint8_t> rx_buffer, fc_buffer;
     
     // Статистика
@@ -48,44 +360,9 @@ private:
     // Callbacks для обробки помилок
     std::function<void(const std::string&)> error_callback;
 
-    // Налаштування кастомної швидкості 420000 baud
-    bool setup_custom_baud_420000(serial_port& port) {
-        try {
-            // Спочатку встановлюємо базові параметри порту
-            port.set_option(serial_port_base::baud_rate(38400)); // Базова швидкість
-            port.set_option(serial_port_base::character_size(8));
-            port.set_option(serial_port_base::parity(serial_port_base::parity::none));
-            port.set_option(serial_port_base::stop_bits(serial_port_base::stop_bits::one));
-            port.set_option(serial_port_base::flow_control(serial_port_base::flow_control::none));
-            
-            // Отримуємо нативний handle для налаштування кастомної швидкості
-            int fd = port.native_handle();
-            
-            struct serial_struct ss;
-            if (ioctl(fd, TIOCGSERIAL, &ss) == 0) {
-                ss.flags = (ss.flags & ~0x0030) | 0x0010;  // ASYNC_SPD_CUST
-                ss.custom_divisor = ss.baud_base / 420000;
-                
-                if (ioctl(fd, TIOCSSERIAL, &ss) == 0) {
-                    std::cout << "✅ Custom baud 420000 встановлено успішно" << std::endl;
-                    return true;
-                } else {
-                    std::cout << "❌ Не вдалося встановити кастомну швидкість 420000" << std::endl;
-                    return false;
-                }
-            }
-            return false;
-            
-        } catch (boost::system::system_error& e) {
-            std::cout << "❌ Помилка налаштування порту: " << e.what() << std::endl;
-            return false;
-        }
-    }
-
 public:
     AsyncCrsfBridge() 
-        : rx_port(io_ctx), fc_port(io_ctx), stats_timer(io_ctx),
-          rx_buffer(BUFFER_SIZE), fc_buffer(BUFFER_SIZE) {}
+        : stats_timer(io_ctx), rx_buffer(BUFFER_SIZE), fc_buffer(BUFFER_SIZE) {}
     
     ~AsyncCrsfBridge() {
         stop();
@@ -99,20 +376,39 @@ public:
     // Відкриття та налаштування портів
     bool connect() {
         try {
-            std::cout << "🔌 Підключення на швидкості " << CRSF_BAUD << " baud..." << std::endl;
+            std::cout << "🔌 Підключення портів з PySerial-подібними налаштуваннями..." << std::endl;
             
-            // Відкриття портів
-            rx_port.open(RX_PORT);
-            fc_port.open(FC_PORT);
+            // Конфігурація порту
+            SerialConfig config;
+            config.baud_rate = CRSF_BAUD;
+            config.timeout = 0.01;      // 10ms timeout
+            config.write_timeout = 0.01;
+            config.low_latency = true;
+            config.exclusive = true;
             
-            // Налаштування кастомної швидкості для обох портів
-            if (!setup_custom_baud_420000(rx_port) || !setup_custom_baud_420000(fc_port)) {
-                std::cout << "❌ Не вдалося налаштувати кастомну швидкість" << std::endl;
+            // Створення нативних портів
+            rx_native = std::make_unique<PySerialLikePort>(RX_PORT, config);
+            fc_native = std::make_unique<PySerialLikePort>(FC_PORT, config);
+            
+            // Підключення нативних портів
+            if (!rx_native->open() || !fc_native->open()) {
                 return false;
             }
             
-            std::cout << "✅ Підключено на швидкості " << CRSF_BAUD << " baud" << std::endl;
+            // Створення Boost.Asio serial_port з нативних дескрипторів
+            rx_port = std::make_unique<serial_port>(io_ctx);
+            fc_port = std::make_unique<serial_port>(io_ctx);
+            
+            // Призначення нативних дескрипторів
+            rx_port->assign(rx_native->get_fd());
+            fc_port->assign(fc_native->get_fd());
+            
+            std::cout << "✅ Порти підключено успішно!" << std::endl;
             std::cout << "📡 Bridge: " << RX_PORT << " ↔ " << FC_PORT << std::endl;
+            
+            // Вивід детальної інформації про порти
+            rx_native->print_port_info();
+            fc_native->print_port_info();
             
             return true;
             
@@ -164,14 +460,18 @@ public:
         
         // Закриття портів
         boost::system::error_code ec;
-        if (rx_port.is_open()) {
-            rx_port.cancel(ec);
-            rx_port.close(ec);
+        if (rx_port && rx_port->is_open()) {
+            rx_port->cancel(ec);
+            rx_port->close(ec);
         }
-        if (fc_port.is_open()) {
-            fc_port.cancel(ec);
-            fc_port.close(ec);
+        if (fc_port && fc_port->is_open()) {
+            fc_port->cancel(ec);
+            fc_port->close(ec);
         }
+        
+        // Закриття нативних портів
+        if (rx_native) rx_native->close();
+        if (fc_native) fc_native->close();
         
         // Чекання завершення IO потоку
         if (io_thread.joinable()) {
@@ -195,11 +495,13 @@ public:
 private:
     // Асинхронне читання з RX порту (USB1 → USB0)
     void start_rx_read() {
-        rx_port.async_read_some(
+        if (!running || !rx_port) return;
+        
+        rx_port->async_read_some(
             buffer(rx_buffer),
-            boost::bind(&AsyncCrsfBridge::handle_rx_read, this,
-                placeholders::error,
-                placeholders::bytes_transferred));
+            [this](const boost::system::error_code& error, size_t bytes_transferred) {
+                handle_rx_read(error, bytes_transferred);
+            });
     }
     
     void handle_rx_read(const boost::system::error_code& error, size_t bytes_transferred) {
@@ -207,19 +509,18 @@ private:
         
         if (!error && bytes_transferred > 0) {
             // Передача даних від RX до FC (USB1 → USB0)
-            async_write(fc_port,
+            async_write(*fc_port,
                 buffer(rx_buffer, bytes_transferred),
-                boost::bind(&AsyncCrsfBridge::handle_rx_write, this,
-                    placeholders::error,
-                    placeholders::bytes_transferred,
-                    bytes_transferred));
+                [this, bytes_transferred](const boost::system::error_code& error, size_t bytes_written) {
+                    handle_rx_write(error, bytes_written, bytes_transferred);
+                });
             
         } else if (error) {
             handle_error("RX read", error);
         }
         
         // Продовження читання
-        if (running && rx_port.is_open()) {
+        if (running && rx_port && rx_port->is_open()) {
             start_rx_read();
         }
     }
@@ -239,11 +540,13 @@ private:
     
     // Асинхронне читання з FC порту (USB0 → USB1)
     void start_fc_read() {
-        fc_port.async_read_some(
+        if (!running || !fc_port) return;
+        
+        fc_port->async_read_some(
             buffer(fc_buffer),
-            boost::bind(&AsyncCrsfBridge::handle_fc_read, this,
-                placeholders::error,
-                placeholders::bytes_transferred));
+            [this](const boost::system::error_code& error, size_t bytes_transferred) {
+                handle_fc_read(error, bytes_transferred);
+            });
     }
     
     void handle_fc_read(const boost::system::error_code& error, size_t bytes_transferred) {
@@ -251,19 +554,18 @@ private:
         
         if (!error && bytes_transferred > 0) {
             // Передача телеметрії від FC до RX (USB0 → USB1)
-            async_write(rx_port,
+            async_write(*rx_port,
                 buffer(fc_buffer, bytes_transferred),
-                boost::bind(&AsyncCrsfBridge::handle_fc_write, this,
-                    placeholders::error,
-                    placeholders::bytes_transferred,
-                    bytes_transferred));
+                [this, bytes_transferred](const boost::system::error_code& error, size_t bytes_written) {
+                    handle_fc_write(error, bytes_written, bytes_transferred);
+                });
             
         } else if (error) {
             handle_error("FC read", error);
         }
         
         // Продовження читання
-        if (running && fc_port.is_open()) {
+        if (running && fc_port && fc_port->is_open()) {
             start_fc_read();
         }
     }
@@ -303,8 +605,9 @@ private:
     void start_stats_timer() {
         stats_timer.expires_from_now(boost::posix_time::seconds(5));
         stats_timer.async_wait(
-            boost::bind(&AsyncCrsfBridge::handle_stats_timer, this,
-                placeholders::error));
+            [this](const boost::system::error_code& error) {
+                handle_stats_timer(error);
+            });
     }
     
     void handle_stats_timer(const boost::system::error_code& error) {
@@ -422,14 +725,15 @@ int main(int argc, char* argv[]) {
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
     
-    std::cout << "🌉 ASYNC CRSF BRIDGE (Boost.Asio)" << std::endl;
+    std::cout << "🌉 ASYNC CRSF BRIDGE (PySerial-подібний)" << std::endl;
     std::cout << "=====================================" << std::endl;
     std::cout << "Конфігурація:" << std::endl;
     std::cout << "  RX Input:  " << RX_PORT << std::endl;
     std::cout << "  FC Output: " << FC_PORT << std::endl;
     std::cout << "  Напрямок: USB1 ↔ USB0 (двосторонній)" << std::endl;
     std::cout << "  Швидкість: " << CRSF_BAUD << " baud (CRSF кастомна)" << std::endl;
-    std::cout << "  Відео: " << RTSP_URL << std::endl << std::endl;
+    std::cout << "  Відео: " << RTSP_URL << std::endl;
+    std::cout << "  Покращення: PySerial-подібні налаштування" << std::endl << std::endl;
     
     // Перевірка наявності портів
     struct stat buffer;
@@ -469,6 +773,7 @@ int main(int argc, char* argv[]) {
     std::cout << "✅ Система працює на швидкості " << bridge.get_baud() << " baud!" << std::endl;
     std::cout << "📊 Статистика кожні 5 секунд" << std::endl;
     std::cout << "🎯 Асинхронна обробка з Boost.Asio" << std::endl;
+    std::cout << "🐍 PySerial-подібні налаштування портів" << std::endl;
     std::cout << "Натисніть Ctrl+C для зупинки" << std::endl << std::endl;
     
     // Головний цикл (GStreamer)
@@ -479,4 +784,3 @@ int main(int argc, char* argv[]) {
     player.stop();
     
     return 0;
-}
