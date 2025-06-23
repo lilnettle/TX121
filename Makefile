@@ -3,8 +3,8 @@
 CXX = g++
 CXXFLAGS = -std=c++17 -Wall -Wextra -O2 -pthread
 DEBUG_FLAGS = -g -DDEBUG -fsanitize=address
-TARGET = radxa_bridge_fixed
-SOURCE = radxa_bridge_fixed.cpp
+TARGET = bridge_radxa
+SOURCE = bridge_radxa.cpp
 
 # GStreamer бібліотеки
 GSTREAMER_CFLAGS = $(shell pkg-config --cflags gstreamer-1.0 2>/dev/null)

@@ -30,7 +30,7 @@
 #include <glib.h>
 
 // НАЛАШТУВАННЯ
-const std::string RX_PORT = "/dev/ttyUSB1";
+const std::string RX_PORT = "/dev/ttyUSB0";
 const std::string CAMERA_IP = "192.168.0.100";
 const std::string RTSP_URL = "rtsp://root:12345@192.168.0.100:554/stream1";
 const int CRSF_UDP_PORT = 5000;
