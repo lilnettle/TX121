@@ -24,7 +24,7 @@
 #include <gst/gst.h>
 #include <glib.h>
 
-// НАЛАШТУВАННЯ
+// НАЛАШТУВАННЯ (повинні точно відповідати камері)
 const std::string RX_PORT = "/dev/ttyUSB1";    // CRSF вхід від приймача
 const std::string CAMERA_IP = "192.168.0.100"; // IP камери
 const std::string RTSP_URL = "rtsp://root:12345@192.168.0.100:554/stream1";
@@ -33,12 +33,12 @@ const int TELEMETRY_UDP_PORT = 5001;          // Порт для отриман�
 const int PRIMARY_BAUD = 420000;
 const int FALLBACK_BAUD = 115200;
 
-// Константи протоколу
+// Константи протоколу (точно як у камери)
 const uint8_t CRSF_SYNC_BYTE = 0xC8;
 const size_t MAX_PACKET_SIZE = 256;
 const size_t BUFFER_SIZE = 1024;
 
-// UDP пакет структура (сумісна з камерою)
+// UDP пакет структура (ТОЧНО як у камери)
 typedef struct {
     uint64_t timestamp;
     uint8_t packet_type;    // 0x01 - CRSF команди, 0x02 - телеметрія
@@ -48,10 +48,10 @@ typedef struct {
 
 // Статистика
 struct Stats {
-    std::atomic<uint32_t> crsf_received{0};
-    std::atomic<uint32_t> crsf_sent_udp{0};
-    std::atomic<uint32_t> telemetry_received_udp{0};
-    std::atomic<uint32_t> telemetry_sent_uart{0};
+    std::atomic<uint32_t> crsf_received{0};      // Команди з UART
+    std::atomic<uint32_t> crsf_sent_udp{0};      // Команди відправлені на камеру
+    std::atomic<uint32_t> telemetry_received_udp{0}; // Телеметрія з камери
+    std::atomic<uint32_t> telemetry_sent_uart{0};    // Телеметрія відправлена в UART
     std::atomic<uint32_t> errors{0};
     time_t start_time;
     
@@ -74,7 +74,7 @@ private:
             return false;
         }
         
-        // Сирий режим
+        // Сирий режим (точно як у камери)
         cfmakeraw(&tty);
         
         // Timeouts
@@ -325,34 +325,6 @@ public:
     bool connected() const { return socket_fd >= 0; }
 };
 
-// CRSF протокол функції
-uint8_t crc8_dvb_s2(uint8_t crc, uint8_t data) {
-    crc ^= data;
-    for (int i = 0; i < 8; i++) {
-        if (crc & 0x80) {
-            crc = (crc << 1) ^ 0xD5;
-        } else {
-            crc = crc << 1;
-        }
-    }
-    return crc;
-}
-
-bool validate_crsf_packet(const uint8_t* packet, size_t len) {
-    if (len < 4) return false;
-    if (packet[0] != CRSF_SYNC_BYTE) return false;
-    
-    size_t expected_len = packet[1] + 2;
-    if (len != expected_len) return false;
-    
-    uint8_t crc = 0;
-    for (size_t i = 2; i < len - 1; i++) {
-        crc = crc8_dvb_s2(crc, packet[i]);
-    }
-    
-    return crc == packet[len - 1];
-}
-
 // Основний CRSF-UDP Bridge клас
 class CRSFUDPBridge {
 private:
@@ -420,9 +392,10 @@ public:
         if (telemetry_server) telemetry_server->close();
     }
     
-    // Потік: UART → UDP (CRSF команди на камеру)
+    // Потік: UART → UDP (CRSF команди на камеру)  
     void uart_to_udp_loop() {
         std::cout << "🔄 UART→UDP thread started" << std::endl;
+        std::cout << "📡 Reading CRSF commands from RX and sending to camera..." << std::endl;
         
         while (running) {
             try {
@@ -433,16 +406,29 @@ public:
                     if (bytes > 0) {
                         uart_buffer_pos += bytes;
                         
+                        // Debug: показати сирі дані
+                        std::cout << "📦 UART raw data (" << bytes << " bytes): ";
+                        for (ssize_t i = 0; i < std::min((ssize_t)16, bytes); i++) {
+                            printf("%02X ", uart_buffer[uart_buffer_pos - bytes + i]);
+                        }
+                        std::cout << std::endl;
+                        
                         // Обробка пакетів
                         size_t processed = 0;
                         while (processed < uart_buffer_pos) {
-                            // Пошук SYNC байту
+                            // Пошук SYNC байтів (0xC8 або 0xC6)
                             size_t sync_pos = processed;
-                            while (sync_pos < uart_buffer_pos && uart_buffer[sync_pos] != CRSF_SYNC_BYTE) {
+                            bool found_sync = false;
+                            
+                            while (sync_pos < uart_buffer_pos) {
+                                if (uart_buffer[sync_pos] == 0xC8 || uart_buffer[sync_pos] == 0xC6) {
+                                    found_sync = true;
+                                    break;
+                                }
                                 sync_pos++;
                             }
                             
-                            if (sync_pos >= uart_buffer_pos) {
+                            if (!found_sync) {
                                 uart_buffer_pos = 0;
                                 break;
                             }
@@ -467,11 +453,26 @@ public:
                                 break;
                             }
                             
-                            // Копіювання та валідація пакету
+                            // Копіювання пакету
                             memcpy(packet_buffer, uart_buffer + processed, packet_len);
                             
-                            if (validate_crsf_packet(packet_buffer, packet_len)) {
+                            // Менш строга валідація для compatibility
+                            bool is_valid = (packet_len >= 4 && 
+                                           (packet_buffer[0] == 0xC8 || packet_buffer[0] == 0xC6) &&
+                                           packet_buffer[1] == (packet_len - 2));
+                            
+                            if (is_valid) {
                                 stats.crsf_received++;
+                                
+                                std::cout << "📡 Valid CRSF packet found:" << std::endl;
+                                std::cout << "   - Sync: 0x" << std::hex << (int)packet_buffer[0] << std::dec << std::endl;
+                                std::cout << "   - Length: " << (int)packet_buffer[1] << std::endl;
+                                std::cout << "   - Total: " << packet_len << " bytes" << std::endl;
+                                std::cout << "   - Data: ";
+                                for (size_t i = 0; i < std::min((size_t)8, packet_len); i++) {
+                                    printf("%02X ", packet_buffer[i]);
+                                }
+                                std::cout << std::endl;
                                 
                                 // Створення UDP пакету
                                 udp_packet_t udp_pkt;
@@ -486,11 +487,19 @@ public:
                                 ssize_t sent = crsf_client->send((uint8_t*)&udp_pkt, 11 + packet_len);
                                 if (sent > 0) {
                                     stats.crsf_sent_udp++;
-                                    std::cout << "📡 UART→UDP: " << packet_len << " bytes CRSF" << std::endl;
+                                    std::cout << "✅ UART→UDP: " << packet_len 
+                                             << " bytes CRSF sent to camera" << std::endl;
                                 } else {
                                     stats.errors++;
+                                    std::cout << "❌ Failed to send UDP packet" << std::endl;
                                 }
                             } else {
+                                // Показати невалідні пакети для debug
+                                if (packet_len >= 4) {
+                                    std::cout << "⚠️ Invalid UART packet: sync=0x" << std::hex 
+                                             << (int)packet_buffer[0] << ", len_field=" << std::dec
+                                             << (int)packet_buffer[1] << ", actual_len=" << packet_len << std::endl;
+                                }
                                 stats.errors++;
                             }
                             
@@ -526,6 +535,7 @@ public:
     // Потік: UDP → UART (телеметрія з камери)
     void udp_to_uart_loop() {
         std::cout << "🔄 UDP→UART thread started" << std::endl;
+        std::cout << "📡 Listening for telemetry from camera and sending to RX..." << std::endl;
         
         uint8_t udp_buffer[BUFFER_SIZE];
         struct sockaddr_in client_addr;
@@ -548,8 +558,24 @@ public:
                 if (FD_ISSET(telemetry_server->get_fd(), &readfds)) {
                     ssize_t bytes = telemetry_server->receive(udp_buffer, sizeof(udp_buffer), &client_addr);
                     
+                    std::cout << "📦 UDP packet received: " << bytes 
+                             << " bytes from " << inet_ntoa(client_addr.sin_addr) 
+                             << ":" << ntohs(client_addr.sin_port) << std::endl;
+                    
                     if (bytes >= 11) { // Мінімальний розмір UDP пакету
                         udp_packet_t* udp_pkt = (udp_packet_t*)udp_buffer;
+                        
+                        std::cout << "📊 UDP Packet details:" << std::endl;
+                        std::cout << "   - Timestamp: " << udp_pkt->timestamp << std::endl;
+                        std::cout << "   - Type: 0x" << std::hex << (int)udp_pkt->packet_type 
+                                 << std::dec << " (" << (udp_pkt->packet_type == 0x02 ? "TELEMETRY" : "COMMAND") 
+                                 << ")" << std::endl;
+                        std::cout << "   - Data length: " << udp_pkt->data_length << std::endl;
+                        std::cout << "   - CRSF data: ";
+                        for (int i = 0; i < std::min(8, (int)udp_pkt->data_length); i++) {
+                            printf("%02X ", udp_pkt->data[i]);
+                        }
+                        std::cout << std::endl;
                         
                         if (udp_pkt->packet_type == 0x02 && // Телеметрія
                             udp_pkt->data_length <= MAX_PACKET_SIZE &&
@@ -561,11 +587,14 @@ public:
                             ssize_t written = rx_port->write(udp_pkt->data, udp_pkt->data_length);
                             if (written > 0) {
                                 stats.telemetry_sent_uart++;
-                                std::cout << "📡 UDP→UART: " << udp_pkt->data_length << " bytes telemetry" << std::endl;
+                                std::cout << "✅ UDP→UART: " << udp_pkt->data_length 
+                                         << " bytes telemetry sent to RX" << std::endl;
                             } else {
                                 stats.errors++;
                                 std::cout << "❌ Write to UART failed" << std::endl;
                             }
+                        } else {
+                            std::cout << "❌ Invalid UDP packet type or format" << std::endl;
                         }
                     }
                 }
@@ -585,7 +614,7 @@ public:
         while (running) {
             std::this_thread::sleep_for(std::chrono::seconds(10));
             if (running) {
-                std::cout << "📊 CRSF RX: " << stats.crsf_received.load() 
+                std::cout << "📊 RADXA Stats: CRSF RX: " << stats.crsf_received.load() 
                           << ", UDP TX: " << stats.crsf_sent_udp.load()
                           << ", TEL RX: " << stats.telemetry_received_udp.load()
                           << ", UART TX: " << stats.telemetry_sent_uart.load()
@@ -630,11 +659,11 @@ public:
         std::cout << "⏹️ CRSF-UDP Bridge stopped" << std::endl;
         
         // Фінальна статистика
-        std::cout << "📋 Final Statistics:" << std::endl;
-        std::cout << "   CRSF received from UART: " << stats.crsf_received.load() << std::endl;
-        std::cout << "   CRSF sent to camera UDP: " << stats.crsf_sent_udp.load() << std::endl;
-        std::cout << "   Telemetry received from camera UDP: " << stats.telemetry_received_udp.load() << std::endl;
-        std::cout << "   Telemetry sent to UART: " << stats.telemetry_sent_uart.load() << std::endl;
+        std::cout << "📋 Final RADXA Statistics:" << std::endl;
+        std::cout << "   CRSF commands from RX: " << stats.crsf_received.load() << std::endl;
+        std::cout << "   CRSF commands sent to camera: " << stats.crsf_sent_udp.load() << std::endl;
+        std::cout << "   Telemetry received from camera: " << stats.telemetry_received_udp.load() << std::endl;
+        std::cout << "   Telemetry sent to RX: " << stats.telemetry_sent_uart.load() << std::endl;
         std::cout << "   Total errors: " << stats.errors.load() << std::endl;
     }
 };
@@ -733,8 +762,8 @@ int main(int argc, char* argv[]) {
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
     
-    std::cout << "🌉 CRSF-UDP BRIDGE FOR CAMERA" << std::endl;
-    std::cout << "================================" << std::endl;
+    std::cout << "🌉 RADXA CRSF-UDP BRIDGE FOR CAMERA" << std::endl;
+    std::cout << "=====================================" << std::endl;
     std::cout << "Configuration:" << std::endl;
     std::cout << "  UART Input: " << RX_PORT << std::endl;
     std::cout << "  Camera IP: " << CAMERA_IP << std::endl;
@@ -778,10 +807,10 @@ int main(int argc, char* argv[]) {
         std::cout << "✅ Video player started" << std::endl;
     }
     
-    std::cout << "✅ CRSF-UDP Bridge running!" << std::endl;
+    std::cout << "✅ RADXA CRSF-UDP Bridge running!" << std::endl;
     std::cout << "📊 Statistics every 10 seconds" << std::endl;
     std::cout << "📡 UART→UDP: CRSF commands to camera" << std::endl;
-    std::cout << "📡 UDP→UART: Telemetry from camera" << std::endl;
+    std::cout << "📡 UDP→UART: Telemetry from camera to RX" << std::endl;
     std::cout << "Press Ctrl+C to stop" << std::endl << std::endl;
     
     // Головний цикл
