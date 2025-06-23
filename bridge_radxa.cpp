@@ -22,17 +22,19 @@
 #include <arpa/inet.h>
 #include <sys/select.h>
 #include <time.h>
+#include <cstdint>
+#include <cstdio>
 
 // GStreamer
 #include <gst/gst.h>
 #include <glib.h>
 
-// НАЛАШТУВАННЯ (повинні точно відповідати камері)
-const std::string RX_PORT = "/dev/ttyUSB0";    // CRSF вхід від приймача
-const std::string CAMERA_IP = "192.168.0.100"; // IP камери
+// НАЛАШТУВАННЯ
+const std::string RX_PORT = "/dev/ttyUSB1";
+const std::string CAMERA_IP = "192.168.0.100";
 const std::string RTSP_URL = "rtsp://root:12345@192.168.0.100:554/stream1";
-const int CRSF_UDP_PORT = 5000;               // Порт для відправки CRSF на камеру
-const int TELEMETRY_UDP_PORT = 5001;          // Порт для отримання телеметрії з камери
+const int CRSF_UDP_PORT = 5000;
+const int TELEMETRY_UDP_PORT = 5001;
 const int PRIMARY_BAUD = 420000;
 const int FALLBACK_BAUD = 115200;
 
@@ -45,33 +47,33 @@ const size_t BUFFER_SIZE = 1024;
 enum class PacketType : uint8_t {
     CRSF_COMMANDS = 0x01,
     TELEMETRY = 0x02,
-    ACK = 0x03,           // Підтвердження отримання
-    HEARTBEAT = 0x04      // Heartbeat для перевірки з'єднання
+    ACK = 0x03,
+    HEARTBEAT = 0x04
 };
 
-// UDP пакет структура
+// UDP пакет структура - ВИПРАВЛЕНО
 typedef struct {
     uint64_t timestamp;
     uint8_t packet_type;
     uint16_t data_length;
-    uint32_t sequence_id;  // Номер пакету для tracking
+    uint32_t sequence_id;
     uint8_t data[MAX_PACKET_SIZE];
 } __attribute__((packed)) udp_packet_t;
 
-// ACK пакет
+// ACK пакет - ВИПРАВЛЕНО
 typedef struct {
     uint64_t timestamp;
     uint8_t packet_type;   // 0x03
-    uint16_t data_length;  // 4
-    uint32_t ack_sequence_id;  // ID пакету що підтверджуємо
+    uint16_t data_length;  // завжди 4
+    uint32_t ack_sequence_id;
 } __attribute__((packed)) ack_packet_t;
 
-// Статистика з детальним tracking
+// Статистика
 struct Stats {
     std::atomic<uint32_t> crsf_received{0};
     std::atomic<uint32_t> crsf_sent_udp{0};
-    std::atomic<uint32_t> crsf_acked{0};         // Підтверджені відправки
-    std::atomic<uint32_t> crsf_failed{0};        // Не підтверджені
+    std::atomic<uint32_t> crsf_acked{0};
+    std::atomic<uint32_t> crsf_failed{0};
     std::atomic<uint32_t> telemetry_received_udp{0};
     std::atomic<uint32_t> telemetry_sent_uart{0};
     std::atomic<uint32_t> heartbeats_sent{0};
@@ -87,53 +89,57 @@ struct Stats {
     }
 };
 
-// Pending ACK tracking
+// Pending ACK tracking - ВИПРАВЛЕНО
 struct PendingPacket {
     uint32_t sequence_id;
     std::chrono::steady_clock::time_point send_time;
-    udp_packet_t packet;
+    std::vector<uint8_t> packet_data;  // Зберігаємо як vector
+    size_t packet_size;
     int retry_count;
     
-    PendingPacket(uint32_t seq, const udp_packet_t& pkt) 
+    PendingPacket(uint32_t seq, const uint8_t* data, size_t size) 
         : sequence_id(seq), send_time(std::chrono::steady_clock::now()), 
-          packet(pkt), retry_count(0) {}
+          packet_size(size), retry_count(0) {
+        packet_data.resize(size);
+        memcpy(packet_data.data(), data, size);
+    }
 };
 
-// Callback функції
+// Callback функції - ВИПРАВЛЕНО типи
 class Callbacks {
 public:
     static void on_crsf_command_sent(uint32_t seq_id, size_t bytes) {
-        printf("📤 [%lu] CRSF command #%u sent (%zu bytes)\n", 
+        printf("📤 [%ld] CRSF command #%u sent (%zu bytes)\n", 
                time(nullptr), seq_id, bytes);
     }
     
     static void on_crsf_command_acked(uint32_t seq_id, uint64_t latency_us) {
-        printf("✅ [%lu] CRSF command #%u acknowledged (latency: %llu μs)\n", 
-               time(nullptr), seq_id, latency_us);
+        printf("✅ [%ld] CRSF command #%u acknowledged (latency: %llu μs)\n", 
+               time(nullptr), seq_id, (unsigned long long)latency_us);
     }
     
     static void on_crsf_command_failed(uint32_t seq_id, const std::string& reason) {
-        printf("❌ [%lu] CRSF command #%u failed: %s\n", 
+        printf("❌ [%ld] CRSF command #%u failed: %s\n", 
                time(nullptr), seq_id, reason.c_str());
     }
     
     static void on_telemetry_received(size_t bytes, const std::string& source) {
-        printf("📥 [%lu] Telemetry received: %zu bytes from %s\n", 
+        printf("📥 [%ld] Telemetry received: %zu bytes from %s\n", 
                time(nullptr), bytes, source.c_str());
     }
     
     static void on_camera_status_changed(bool online, const std::string& details) {
-        printf("🔄 [%lu] Camera status: %s (%s)\n", 
+        printf("🔄 [%ld] Camera status: %s (%s)\n", 
                time(nullptr), online ? "ONLINE" : "OFFLINE", details.c_str());
     }
     
     static void on_connection_quality(float success_rate, uint64_t avg_latency) {
-        printf("📊 [%lu] Connection quality: %.1f%% success, %llu μs avg latency\n",
-               time(nullptr), success_rate * 100, avg_latency);
+        printf("📊 [%ld] Connection quality: %.1f%% success, %llu μs avg latency\n",
+               time(nullptr), success_rate * 100, (unsigned long long)avg_latency);
     }
 };
 
-// Серійний порт клас (без змін)
+// Серійний порт клас
 class SerialPort {
 private:
     int fd = -1;
@@ -281,7 +287,7 @@ public:
     const std::string& get_name() const { return port_name; }
 };
 
-// UDP клієнт з ACK tracking
+// UDP клієнт з ACK tracking - ВИПРАВЛЕНО
 class UDPClientWithACK {
 private:
     int socket_fd = -1;
@@ -290,9 +296,9 @@ private:
     int server_port;
     std::atomic<uint32_t> sequence_counter{1};
     
-    // ACK tracking
+    // ACK tracking - ВИПРАВЛЕНО mutex
     std::map<uint32_t, PendingPacket> pending_packets;
-    std::mutex pending_mutex;
+    mutable std::mutex pending_mutex;  // mutable для const методів
     std::thread ack_monitor_thread;
     std::atomic<bool> running{false};
 
@@ -344,29 +350,40 @@ public:
     uint32_t send_with_ack(const uint8_t* data, size_t size) {
         if (socket_fd < 0) return 0;
         
-        // Створити пакет з sequence ID
-        udp_packet_t packet;
+        // Створити UDP пакет
+        std::vector<uint8_t> packet_buffer(sizeof(udp_packet_t));
+        udp_packet_t* packet = reinterpret_cast<udp_packet_t*>(packet_buffer.data());
+        
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
-        packet.timestamp = ts.tv_sec * 1000000LL + ts.tv_nsec / 1000;
-        packet.packet_type = static_cast<uint8_t>(PacketType::CRSF_COMMANDS);
-        packet.data_length = size;
-        packet.sequence_id = sequence_counter++;
-        memcpy(packet.data, data, size);
+        packet->timestamp = static_cast<uint64_t>(ts.tv_sec) * 1000000ULL + ts.tv_nsec / 1000;
+        packet->packet_type = static_cast<uint8_t>(PacketType::CRSF_COMMANDS);
+        packet->data_length = static_cast<uint16_t>(size);
+        packet->sequence_id = sequence_counter++;
+        
+        // Копіювати дані
+        if (size > 0 && size <= MAX_PACKET_SIZE) {
+            memcpy(packet->data, data, size);
+        }
+        
+        // Розрахувати фактичний розмір пакету
+        size_t packet_size = sizeof(udp_packet_t) - MAX_PACKET_SIZE + size;
         
         // Відправити
-        ssize_t sent = sendto(socket_fd, &packet, sizeof(packet) - MAX_PACKET_SIZE + size, 0,
+        ssize_t sent = sendto(socket_fd, packet, packet_size, 0,
                              (struct sockaddr*)&server_addr, sizeof(server_addr));
         
         if (sent > 0) {
-            // Додати до pending для ACK tracking
+            // Додати до pending
             {
                 std::lock_guard<std::mutex> lock(pending_mutex);
-                pending_packets.emplace(packet.sequence_id, PendingPacket(packet.sequence_id, packet));
+                pending_packets.emplace(std::piecewise_construct,
+                    std::forward_as_tuple(packet->sequence_id),
+                    std::forward_as_tuple(packet->sequence_id, packet_buffer.data(), packet_size));
             }
             
-            Callbacks::on_crsf_command_sent(packet.sequence_id, size);
-            return packet.sequence_id;
+            Callbacks::on_crsf_command_sent(packet->sequence_id, size);
+            return packet->sequence_id;
         }
         
         return 0;
@@ -380,14 +397,14 @@ public:
             auto now = std::chrono::steady_clock::now();
             auto latency = std::chrono::duration_cast<std::chrono::microseconds>(now - send_time).count();
             
-            Callbacks::on_crsf_command_acked(ack_seq_id, latency);
+            Callbacks::on_crsf_command_acked(ack_seq_id, static_cast<uint64_t>(latency));
             pending_packets.erase(it);
         }
     }
     
 private:
     void ack_monitor_loop() {
-        const auto timeout = std::chrono::seconds(2); // 2 секунди timeout
+        const auto timeout = std::chrono::seconds(2);
         const int max_retries = 3;
         
         while (running) {
@@ -405,8 +422,7 @@ private:
                             pending.retry_count++;
                             pending.send_time = now;
                             
-                            sendto(socket_fd, &pending.packet, 
-                                  sizeof(pending.packet) - MAX_PACKET_SIZE + pending.packet.data_length, 0,
+                            sendto(socket_fd, pending.packet_data.data(), pending.packet_size, 0,
                                   (struct sockaddr*)&server_addr, sizeof(server_addr));
                             
                             printf("🔄 Retrying packet #%u (attempt %d/%d)\n", 
@@ -435,14 +451,13 @@ public:
         return pending_packets.size();
     }
     
-    void get_stats(float& success_rate, uint64_t& avg_latency) {
-        // Тут можна додати детальну статистику
+    void get_stats(float& success_rate, uint64_t& avg_latency) const {
         success_rate = 0.95f; // Placeholder
         avg_latency = 1000;   // Placeholder
     }
 };
 
-// UDP сервер (без змін)
+// UDP сервер
 class UDPServer {
 private:
     int socket_fd = -1;
@@ -501,7 +516,7 @@ public:
     bool connected() const { return socket_fd >= 0; }
 };
 
-// Основний CRSF-UDP Bridge клас з feedback
+// Основний CRSF-UDP Bridge клас - ВИПРАВЛЕНО
 class CRSFUDPBridgeWithFeedback {
 private:
     std::unique_ptr<SerialPort> rx_port;
@@ -570,13 +585,11 @@ public:
     // Heartbeat потік
     void heartbeat_loop() {
         while (running) {
-            // Відправити heartbeat кожні 5 секунд
             std::this_thread::sleep_for(std::chrono::seconds(5));
             
             if (!running) break;
             
-            // Створити heartbeat пакет
-            uint8_t heartbeat_data[] = {0xFF, 0x01, 0x00, 0x01}; // Простий heartbeat
+            uint8_t heartbeat_data[] = {0xFF, 0x01, 0x00, 0x01};
             uint32_t seq_id = crsf_client->send_with_ack(heartbeat_data, sizeof(heartbeat_data));
             
             if (seq_id > 0) {
@@ -584,9 +597,8 @@ public:
                 printf("💗 Heartbeat #%u sent to camera\n", seq_id);
             }
             
-            // Перевірити статус камери
             bool was_online = stats.camera_online.load();
-            bool is_online = (time(nullptr) - stats.last_camera_response) < 15; // 15 секунд timeout
+            bool is_online = (time(nullptr) - stats.last_camera_response) < 15;
             
             if (was_online != is_online) {
                 stats.camera_online = is_online;
@@ -596,7 +608,7 @@ public:
         }
     }
     
-    // UART → UDP з ACK tracking
+    // UART → UDP
     void uart_to_udp_loop() {
         std::cout << "🔄 UART→UDP thread started with ACK tracking" << std::endl;
         
@@ -656,7 +668,6 @@ public:
                             if (is_valid) {
                                 stats.crsf_received++;
                                 
-                                // Відправити з ACK tracking
                                 uint32_t seq_id = crsf_client->send_with_ack(packet_buffer, packet_len);
                                 if (seq_id > 0) {
                                     stats.crsf_sent_udp++;
@@ -692,7 +703,7 @@ public:
         }
     }
     
-    // UDP → UART з обробкою ACK
+    // UDP → UART - ВИПРАВЛЕНО порівняння розмірів
     void udp_to_uart_loop() {
         std::cout << "🔄 UDP→UART thread started with ACK processing" << std::endl;
         
@@ -716,15 +727,16 @@ public:
                 if (FD_ISSET(telemetry_server->get_fd(), &readfds)) {
                     ssize_t bytes = telemetry_server->receive(udp_buffer, sizeof(udp_buffer), &client_addr);
                     
-                    if (bytes >= sizeof(udp_packet_t) - MAX_PACKET_SIZE) {
-                        udp_packet_t* udp_pkt = (udp_packet_t*)udp_buffer;
+                    // ВИПРАВЛЕНО порівняння розмірів
+                    if (static_cast<size_t>(bytes) >= (sizeof(udp_packet_t) - MAX_PACKET_SIZE)) {
+                        udp_packet_t* udp_pkt = reinterpret_cast<udp_packet_t*>(udp_buffer);
                         stats.last_camera_response = time(nullptr);
                         
                         PacketType pkt_type = static_cast<PacketType>(udp_pkt->packet_type);
                         
                         switch (pkt_type) {
                             case PacketType::TELEMETRY:
-                                if (bytes >= sizeof(udp_packet_t) - MAX_PACKET_SIZE + udp_pkt->data_length) {
+                                if (static_cast<size_t>(bytes) >= (sizeof(udp_packet_t) - MAX_PACKET_SIZE + udp_pkt->data_length)) {
                                     stats.telemetry_received_udp++;
                                     
                                     ssize_t written = rx_port->write(udp_pkt->data, udp_pkt->data_length);
@@ -739,8 +751,8 @@ public:
                                 break;
                                 
                             case PacketType::ACK:
-                                if (bytes >= sizeof(ack_packet_t)) {
-                                    ack_packet_t* ack_pkt = (ack_packet_t*)udp_buffer;
+                                if (static_cast<size_t>(bytes) >= sizeof(ack_packet_t)) {
+                                    ack_packet_t* ack_pkt = reinterpret_cast<ack_packet_t*>(udp_buffer);
                                     stats.crsf_acked++;
                                     crsf_client->process_ack(ack_pkt->ack_sequence_id, ack_pkt->timestamp);
                                 }
@@ -868,7 +880,7 @@ public:
         std::cout << "❌ Commands failed: " << stats.crsf_failed.load() << std::endl;
         
         if (stats.crsf_sent_udp.load() > 0) {
-            float success_rate = (float)stats.crsf_acked.load() / stats.crsf_sent_udp.load();
+            float success_rate = static_cast<float>(stats.crsf_acked.load()) / stats.crsf_sent_udp.load();
             std::cout << "📊 Overall success rate: " << (success_rate * 100) << "%" << std::endl;
         }
         
@@ -879,7 +891,7 @@ public:
     }
 };
 
-// Відеоплеєр (без змін)
+// Відеоплеєр
 class SimpleVideoPlayer {
 private:
     GstElement* playbin = nullptr;
@@ -973,8 +985,8 @@ int main(int argc, char* argv[]) {
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
     
-    std::cout << "🌉 RADXA CRSF-UDP BRIDGE WITH FEEDBACK" << std::endl;
-    std::cout << "=======================================" << std::endl;
+    std::cout << "🌉 RADXA CRSF-UDP BRIDGE WITH FEEDBACK (FIXED)" << std::endl;
+    std::cout << "================================================" << std::endl;
     std::cout << "Configuration:" << std::endl;
     std::cout << "  UART Input: " << RX_PORT << std::endl;
     std::cout << "  Camera IP: " << CAMERA_IP << std::endl;
