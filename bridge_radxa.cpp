@@ -28,7 +28,7 @@
 #include <glib.h>
 
 // НАЛАШТУВАННЯ (повинні точно відповідати камері)
-const std::string RX_PORT = "/dev/ttyUSB1";    // CRSF вхід від приймача
+const std::string RX_PORT = "/dev/ttyUSB0";    // CRSF вхід від приймача
 const std::string CAMERA_IP = "192.168.0.100"; // IP камери
 const std::string RTSP_URL = "rtsp://root:12345@192.168.0.100:554/stream1";
 const int CRSF_UDP_PORT = 5000;               // Порт для відправки CRSF на камеру
