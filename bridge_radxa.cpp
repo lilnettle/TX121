@@ -17,14 +17,16 @@
 // Boost.Asio
 #include <boost/asio.hpp>
 #include <boost/asio/serial_port.hpp>
-#include <boost/bind.hpp>
+#include <boost/asio/steady_timer.hpp>
 #include <boost/system/error_code.hpp>
+#include <functional>
 
 // GStreamer
 #include <gst/gst.h>
 #include <glib.h>
 
 using namespace boost::asio;
+using steady_timer = boost::asio::steady_timer;
 
 // Конфігурація
 const std::string RTSP_URL = "rtsp://root:12345@192.168.0.100:554/stream1";
@@ -346,7 +348,7 @@ private:
     io_context io_ctx;
     std::unique_ptr<serial_port> rx_port, fc_port;
     std::unique_ptr<PySerialLikePort> rx_native, fc_native;
-    deadline_timer stats_timer;
+    std::unique_ptr<steady_timer> stats_timer;
     std::thread io_thread;
     
     // Буфери для асинхронного читання
@@ -362,7 +364,9 @@ private:
 
 public:
     AsyncCrsfBridge() 
-        : stats_timer(io_ctx), rx_buffer(BUFFER_SIZE), fc_buffer(BUFFER_SIZE) {}
+        : rx_buffer(BUFFER_SIZE), fc_buffer(BUFFER_SIZE) {
+        stats_timer = std::make_unique<steady_timer>(io_ctx);
+    }
     
     ~AsyncCrsfBridge() {
         stop();
@@ -400,8 +404,18 @@ public:
             fc_port = std::make_unique<serial_port>(io_ctx);
             
             // Призначення нативних дескрипторів
-            rx_port->assign(rx_native->get_fd());
-            fc_port->assign(fc_native->get_fd());
+            boost::system::error_code ec;
+            rx_port->assign(rx_native->get_fd(), ec);
+            if (ec) {
+                std::cout << "❌ Помилка assign RX порту: " << ec.message() << std::endl;
+                return false;
+            }
+            
+            fc_port->assign(fc_native->get_fd(), ec);
+            if (ec) {
+                std::cout << "❌ Помилка assign FC порту: " << ec.message() << std::endl;
+                return false;
+            }
             
             std::cout << "✅ Порти підключено успішно!" << std::endl;
             std::cout << "📡 Bridge: " << RX_PORT << " ↔ " << FC_PORT << std::endl;
@@ -603,8 +617,8 @@ private:
     
     // Таймер статистики
     void start_stats_timer() {
-        stats_timer.expires_from_now(boost::posix_time::seconds(5));
-        stats_timer.async_wait(
+        stats_timer->expires_after(std::chrono::seconds(5));
+        stats_timer->async_wait(
             [this](const boost::system::error_code& error) {
                 handle_stats_timer(error);
             });
